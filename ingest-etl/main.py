@@ -32,6 +32,10 @@ topic_path = publisher.topic_path(PROJECT_ID, DOCAI_REQUESTS_TOPIC)
 # =========================
 
 def _ascii_safe_name(filename: str) -> str:
+    """
+    Turn any filename into an ASCII-safe version while keeping the extension.
+    NOTE: this is used only for canonical naming; we always preserve the original unicode name in Firestore.
+    """
     if "." in filename:
         base, ext = filename.rsplit(".", 1)
         ext = "." + ext.lower()
@@ -81,6 +85,18 @@ def _parse_eventarc_cloudevent(request):
     except Exception as e:
         return None, str(e)
 
+
+def _infer_case(inbox_object_name: str) -> str:
+    """
+    Case is the first path segment of the inbox object:
+      shemesh/file.pdf  -> shemesh
+      file.pdf          -> _default
+    """
+    if "/" in inbox_object_name:
+        first = inbox_object_name.split("/", 1)[0].strip()
+        return first if first else "_default"
+    return "_default"
+
 # =========================
 # Entry point
 # =========================
@@ -119,6 +135,11 @@ def ingest_etl(request):
         print(f"Ignoring placeholder object: {name}")
         return ("ignored", 200)
 
+    # Derive case + original (unicode) filename
+    case = _infer_case(name)
+    original_filename = os.path.basename(name)  # unicode-safe (Hebrew preserved)
+    ascii_safe = _ascii_safe_name(original_filename)
+
     b_in = storage_client.bucket(INBOX_BUCKET)
     blob = b_in.blob(name)
     blob.reload()
@@ -126,55 +147,65 @@ def ingest_etl(request):
     size = int(blob.size or 0)
     content_type = blob.content_type or ""
 
+    # Stable doc identity = sha256 of inbox object contents
     sha = _sha256_gcs(INBOX_BUCKET, name)
     doc_id = sha
 
     doc_ref = fs.collection("documents").document(doc_id)
     existing = doc_ref.get()
 
+    # Duplicate: archive into RAW duplicates/ and delete inbox object
     if existing.exists:
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        raw_name = f"duplicates/{ts}_{os.path.basename(name)}"
-        storage_client.bucket(RAW_BUCKET).blob(raw_name).rewrite(blob)
+        dup_name = f"duplicates/{ts}/{case}/{sha[:12]}_{ascii_safe}"
+        storage_client.bucket(RAW_BUCKET).blob(dup_name).rewrite(blob)
         blob.delete()
+        print(f"DUPLICATE docId={doc_id} -> gs://{RAW_BUCKET}/{dup_name}")
         return ("duplicate archived", 200)
 
-    safe = _ascii_safe_name(os.path.basename(name))
-    if "." in safe:
-        base, ext = safe.rsplit(".", 1)
+    # Canonical filename: ASCII-safe + short hash suffix
+    if "." in ascii_safe:
+        base, ext = ascii_safe.rsplit(".", 1)
         canonical_name = f"{base}_{sha[:12]}.{ext}"
     else:
-        canonical_name = f"{safe}_{sha[:12]}"
+        canonical_name = f"{ascii_safe}_{sha[:12]}"
 
-    canonical_path = f"canonical/{canonical_name}"
+    # Keep canonical separated by case
+    canonical_path = f"canonical/{case}/{canonical_name}"
 
     b_can = storage_client.bucket(CANONICAL_BUCKET)
     b_can.blob(canonical_path).rewrite(blob)
 
+    # Raw path keeps full original inbox object key for provenance
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     raw_path = f"raw/{ts}/{name}"
     storage_client.bucket(RAW_BUCKET).blob(raw_path).rewrite(blob)
 
+    # Inbox object consumed
     blob.delete()
 
     canonical_gcs_uri = f"gs://{CANONICAL_BUCKET}/{canonical_path}"
-    original_gcs_uri = f"gs://{RAW_BUCKET}/{raw_path}"
+    raw_gcs_uri = f"gs://{RAW_BUCKET}/{raw_path}"
 
+    # Persist metadata for provenance + monitoring
     doc_ref.set(
         {
             "docId": doc_id,
             "sha256": sha,
+            "case": case,
             "sizeBytes": size,
             "contentType": content_type,
             "original": {
-                "gcsUri": original_gcs_uri,
-                "filename": os.path.basename(name),
-                "inboxObject": name,
+                "gcsUri": raw_gcs_uri,
+                "filenameOriginal": original_filename,   # unicode (Hebrew preserved)
+                "filenameAsciiSafe": ascii_safe,
+                "inboxObject": name,                    # full key (case/path/filename)
             },
             "canonical": {
                 "gcsUri": canonical_gcs_uri,
                 "filename": canonical_name,
                 "object": canonical_path,
+                "bucket": CANONICAL_BUCKET,
             },
             "status": "CANONICALIZED",
             "createdAt": firestore.SERVER_TIMESTAMP,
@@ -182,15 +213,23 @@ def ingest_etl(request):
         }
     )
 
+    # Publish to docai-runner
     msg = {
         "docId": doc_id,
+        "case": case,
         "canonicalGcsUri": canonical_gcs_uri,
         "canonicalObject": canonical_path,
         "canonicalBucket": CANONICAL_BUCKET,
-        "rawGcsUri": original_gcs_uri,
+        "rawGcsUri": raw_gcs_uri,
+        "rawObject": raw_path,
+        "rawBucket": RAW_BUCKET,
+        "originalFilename": original_filename,
+        "originalInboxObject": name,
+        "sizeBytes": size,
+        "contentType": content_type,
     }
 
-    publisher.publish(topic_path, json.dumps(msg).encode("utf-8"))
+    publisher.publish(topic_path, json.dumps(msg, ensure_ascii=False).encode("utf-8"))
 
-    print(f"OK docId={doc_id} canonical={canonical_gcs_uri}")
+    print(f"OK docId={doc_id} case={case} canonical={canonical_gcs_uri} original={original_filename}")
     return ("ok", 200)
