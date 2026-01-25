@@ -1,0 +1,10 @@
+Din-AI Document AI Test PDF
+==========================
+
+Tenant: dinai-tenant-internal-001
+Purpose: Smoke test for DocAI runner
+
+This is a real PDF file generated locally.
+If Document AI can parse this, the pipeline works.
+
+Generated at: 2026-01-24 23:16:27

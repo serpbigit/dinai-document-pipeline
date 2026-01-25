@@ -2,7 +2,7 @@ import base64
 import json
 import os
 import traceback
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
 import functions_framework
@@ -15,20 +15,12 @@ from google.cloud import pubsub_v1
 from google.protobuf.json_format import MessageToDict
 
 # =============================================================================
-# VERSION (change this string every deploy to confirm you're running the right code)
-# =============================================================================
-VERSION = "2026-01-24T-mainpy-AtoZ-v1"
-
-# =============================================================================
 # Environment (required)
 # =============================================================================
 PROJECT_ID = os.environ["PROJECT_ID"]
 DOCAI_PROCESSOR = os.environ["DOCAI_PROCESSOR"]          # full resource name
 DOCAI_RESULTS_TOPIC = os.environ["DOCAI_RESULTS_TOPIC"]  # topic name (not full path)
 DOCAI_OUT_BUCKET = os.environ["DOCAI_OUT_BUCKET"]        # bucket name, without gs://
-
-# Lock settings (prevents concurrent duplicates + handles Pub/Sub at-least-once)
-LOCK_MINUTES = int(os.environ.get("DOCAI_LOCK_MINUTES", "15"))
 
 # =============================================================================
 # Clients (module-level reuse)
@@ -42,32 +34,32 @@ topic_path = publisher.topic_path(PROJECT_ID, DOCAI_RESULTS_TOPIC)
 # Helpers
 # =============================================================================
 
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
 def _utc_ts() -> str:
-    return _utc_now().strftime("%Y%m%dT%H%M%SZ")
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
 
 def _is_pubsub_like_request(request: Request, body: Optional[dict]) -> bool:
-    # CloudEvents headers (often present on Pub/Sub push)
+    """
+    Heuristic: identify Pub/Sub push (or Eventarc-wrapped Pub/Sub) so we can ACK (2xx)
+    even on bad payload to avoid infinite retries / poison loops.
+    """
     if request.headers.get("ce-type") or request.headers.get("ce-id") or request.headers.get("ce-source"):
         return True
-
-    # Pub/Sub push envelope patterns
     if isinstance(body, dict):
         if isinstance(body.get("message"), dict):
             return True
         data = body.get("data")
         if isinstance(data, dict) and isinstance(data.get("message"), dict):
             return True
-
     return False
+
 
 def _parse_json_body(request: Request) -> Tuple[Optional[Dict[str, Any]], str]:
     """
-    Tries Flask request.get_json() first.
-    If it returns None / non-dict, falls back to raw bytes -> utf-8 -> json.loads.
-    Returns (dict_or_none, err_string).
+    Robustly parse JSON from:
+      - request.get_json()
+      - raw bytes request.data
+    Never treat bytes like a dict (fixes 'bytes' object has no attribute 'get').
     """
     body = request.get_json(silent=True)
     if isinstance(body, dict):
@@ -85,22 +77,28 @@ def _parse_json_body(request: Request) -> Tuple[Optional[Dict[str, Any]], str]:
     except Exception:
         return None, "Request body is not valid JSON"
 
+
 def _unwrap_cloudevent_if_needed(body: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Some platforms wrap event payload as { "data": {...} }.
-    If present, return body["data"], else return body.
+    Support CloudEvent structured mode bodies:
+      {
+        "specversion": "...",
+        "type": "...",
+        "source": "...",
+        "id": "...",
+        "time": "...",
+        "data": { ... }   # may contain Pub/Sub envelope or direct payload
+      }
     """
     data = body.get("data")
     if isinstance(data, dict):
+        # If this is a CloudEvent wrapper, use data as the "working body"
+        # (works for both direct payload and Pub/Sub envelope under data.message)
         return data
     return body
 
+
 def _decode_pubsub_data_to_job(message: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str]:
-    """
-    Pub/Sub push envelope has:
-      { message: { data: "<base64>", ... } }
-    This decodes base64->utf8->json dict.
-    """
     b64 = message.get("data")
     if not b64:
         return None, "Pub/Sub envelope missing message.data"
@@ -123,40 +121,49 @@ def _decode_pubsub_data_to_job(message: Dict[str, Any]) -> Tuple[Optional[Dict[s
     except Exception as e:
         return None, f"Failed to parse decoded JSON: {e}"
 
-def _extract_job_from_http_request(request: Request) -> Tuple[Optional[Dict[str, Any]], str, bool, Optional[str]]:
-    """
-    Returns: (job, err, is_pubsub_like, pubsub_message_id)
 
+def _extract_job_from_http_request(request: Request) -> Tuple[Optional[Dict[str, Any]], str, bool]:
+    """
     Supports:
-      A) Pub/Sub push envelope (possibly CloudEvent wrapped)
-      B) Direct HTTP JSON job payload: { docId, canonicalGcsUri, ... }
+    A) Pub/Sub push JSON envelope:
+       { "message": { "data": "<base64-json>" , ... }, "subscription": "..." }
+
+    B) Eventarc / CloudEvent structured mode:
+       { ..., "data": { "message": { "data": "<base64-json>" } } }   OR
+       { ..., "data": { "docId": "...", "canonicalGcsUri": "..." } }
+
+    C) Direct JSON job (manual curl/test):
+       { "docId": "...", "canonicalGcsUri": "...", ... }
+
+    Returns: (job, err, is_pubsub_like)
     """
     body, err = _parse_json_body(request)
     if err:
-        return None, err, _is_pubsub_like_request(request, None), None
+        return None, err, _is_pubsub_like_request(request, None)
 
+    # unwrap CloudEvent structured body if applicable
     working = _unwrap_cloudevent_if_needed(body)
+
     is_pubsub_like = _is_pubsub_like_request(request, body) or _is_pubsub_like_request(request, working)
 
-    # Pub/Sub envelope
+    # Pub/Sub envelope (standard)
     if isinstance(working, dict) and isinstance(working.get("message"), dict):
-        msg = working["message"]
-        msg_id = msg.get("messageId") or msg.get("message_id")
-        job, derr = _decode_pubsub_data_to_job(msg)
+        job, derr = _decode_pubsub_data_to_job(working["message"])
         if derr:
-            return None, derr, True, msg_id
-        return job, "", True, msg_id
+            return None, derr, True
+        return job, "", True
 
     # Direct job
     if isinstance(working, dict) and "docId" in working and "canonicalGcsUri" in working:
-        return working, "", is_pubsub_like, None
+        return working, "", is_pubsub_like
 
-    return None, "Unrecognized payload format", is_pubsub_like, None
+    return None, "Unrecognized payload format", is_pubsub_like
+
 
 def _compute_page_scores_from_document_layout(doc_like: dict):
     """
-    Lightweight heuristic "quality-ish" scoring using Document Layout blocks.
-    This is NOT DocAI confidence; it's a signal: more extracted text + more blocks => higher score.
+    Best-effort heuristic score based on DocumentAI documentLayout.blocks.
+    Keep as-is but make it safe.
     """
     layout = doc_like.get("documentLayout") or {}
     blocks = layout.get("blocks") or []
@@ -169,7 +176,6 @@ def _compute_page_scores_from_document_layout(doc_like: dict):
         p = span.get("pageStart")
         if not p:
             continue
-
         txt = ((b.get("textBlock") or {}).get("text")) or ""
         pages.setdefault(p, {"page": p, "textLen": 0, "numBlocks": 0})
         pages[p]["textLen"] += len(txt)
@@ -179,7 +185,6 @@ def _compute_page_scores_from_document_layout(doc_like: dict):
     for p in sorted(pages.keys()):
         tl = pages[p]["textLen"]
         nb = pages[p]["numBlocks"]
-
         s_len = min(1.0, tl / 3000.0)
         s_blk = min(1.0, nb / 10.0)
         score = round(s_len * s_blk, 4)
@@ -202,197 +207,163 @@ def _compute_page_scores_from_document_layout(doc_like: dict):
     doc_score = round(sum(r["score"] for r in results) / len(results), 4)
     return results, doc_score
 
+
 def _write_json_to_gcs(prefix: str, obj_name: str, payload: dict):
     b = storage_client.bucket(DOCAI_OUT_BUCKET)
     blob = b.blob(f"{prefix}/{obj_name}")
-    blob.upload_from_string(json.dumps(payload, ensure_ascii=False), content_type="application/json")
+    blob.upload_from_string(
+        json.dumps(payload, ensure_ascii=False),
+        content_type="application/json",
+    )
 
-def _mark_failed(doc_id: str, error: str):
-    fs.collection("documents").document(doc_id).set({
-        "status": "DOCAI_FAILED",
-        "docai": {
-            "error": error,
-            "finishedAtUtc": _utc_ts(),
-            "processor": DOCAI_PROCESSOR,
-            "lockUntilUtc": None,
-        },
-        "updatedAt": firestore.SERVER_TIMESTAMP,
-    }, merge=True)
 
-def _claim_lock_or_skip(doc_id: str, pubsub_message_id: Optional[str]) -> Tuple[bool, str]:
-    """
-    Firestore transaction:
-      - If status DOCAI_DONE -> skip
-      - If same pubsub_message_id already processed -> skip
-      - If lockUntilUtc in future and status DOCAI_RUNNING -> skip
-      - Else set DOCAI_RUNNING and lockUntilUtc and proceed
-    """
-    doc_ref = fs.collection("documents").document(doc_id)
-
-    @firestore.transactional
-    def _txn(txn: firestore.Transaction) -> Tuple[bool, str]:
-        snap = doc_ref.get(transaction=txn)
-        data = snap.to_dict() or {}
-
-        status = data.get("status")
-        docai = data.get("docai") or {}
-        last_msg = docai.get("lastPubsubMessageId")
-        lock_until = docai.get("lockUntilUtc")  # stored as compact UTC string
-        now = _utc_now()
-
-        if status == "DOCAI_DONE":
-            return False, "already_done"
-
-        if pubsub_message_id and last_msg == pubsub_message_id:
-            return False, "duplicate_message_id"
-
-        if isinstance(lock_until, str) and lock_until:
-            try:
-                lu = datetime.strptime(lock_until, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
-                if status == "DOCAI_RUNNING" and lu > now:
-                    return False, "locked_running"
-            except Exception:
-                pass
-
-        new_lock = (now + timedelta(minutes=LOCK_MINUTES)).strftime("%Y%m%dT%H%M%SZ")
-
-        update = {
-            "status": "DOCAI_RUNNING",
+def _fail_firestore(doc_id: str, status: str, error: str):
+    try:
+        fs.collection("documents").document(doc_id).set({
+            "status": status,
             "docai": {
+                "error": error,
+                "updatedAtUtc": _utc_ts(),
                 "processor": DOCAI_PROCESSOR,
-                "startedAtUtc": _utc_ts(),
-                "lockUntilUtc": new_lock,
             },
             "updatedAt": firestore.SERVER_TIMESTAMP,
-        }
-        if pubsub_message_id:
-            update["docai"]["lastPubsubMessageId"] = pubsub_message_id
+        }, merge=True)
+    except Exception:
+        # Don't crash on secondary failure
+        print("WARN: failed to update firestore failure state")
 
-        txn.set(doc_ref, update, merge=True)
-        return True, "proceed"
 
-    txn = fs.transaction()
-    return _txn(txn)
-
-def _process_job(job: Dict[str, Any], pubsub_message_id: Optional[str]) -> Tuple[str, int]:
+def _process_job(job: Dict[str, Any]) -> Tuple[str, int]:
     doc_id = job["docId"]
     canonical_gcs_uri = job["canonicalGcsUri"]
 
-    proceed, reason = _claim_lock_or_skip(doc_id, pubsub_message_id)
-    if not proceed:
-        print(f"SKIP docId={doc_id} reason={reason} msgId={pubsub_message_id}")
-        return ("ok", 200)
+    # Firestore mark running
+    doc_ref = fs.collection("documents").document(doc_id)
+    doc_ref.set({
+        "status": "DOCAI_RUNNING",
+        "docai": {
+            "processor": DOCAI_PROCESSOR,
+            "startedAtUtc": _utc_ts(),
+        },
+        "updatedAt": firestore.SERVER_TIMESTAMP
+    }, merge=True)
 
     # DocAI call
     client = documentai.DocumentProcessorServiceClient()
+
+    # Keep your current request style (works with GCS URI)
     req = documentai.ProcessRequest(
         name=DOCAI_PROCESSOR,
-        gcs_document=documentai.GcsDocument(gcs_uri=canonical_gcs_uri, mime_type="application/pdf"),
+        gcs_document=documentai.GcsDocument(
+            gcs_uri=canonical_gcs_uri,
+            mime_type="application/pdf",
+        ),
     )
+
     result = client.process_document(request=req)
 
     doc_dict = MessageToDict(result.document._pb, preserving_proto_field_name=True)
+
     pages, doc_score = _compute_page_scores_from_document_layout(doc_dict)
 
     ts = _utc_ts()
+    prefix = f"{doc_id}/{ts}"
 
-    # Run history + stable latest pointer
-    run_prefix = f"{doc_id}/{ts}"
-    latest_prefix = f"{doc_id}/latest"
+    # Write outputs
+    _write_json_to_gcs(prefix, "docai_document.json", doc_dict)
 
-    _write_json_to_gcs(run_prefix, "docai_document.json", doc_dict)
-    _write_json_to_gcs(run_prefix, "manifest.json", {
+    manifest = {
         "docId": doc_id,
         "canonicalGcsUri": canonical_gcs_uri,
         "rawGcsUri": job.get("rawGcsUri"),
         "processor": DOCAI_PROCESSOR,
         "createdAtUtc": ts,
         "docQualityScore": doc_score,
-        "pubsubMessageId": pubsub_message_id,
-        "version": VERSION,
-    })
+    }
+    _write_json_to_gcs(prefix, "manifest.json", manifest)
 
-    _write_json_to_gcs(latest_prefix, "manifest.json", {
-        "docId": doc_id,
-        "latestRunPrefix": f"gs://{DOCAI_OUT_BUCKET}/{run_prefix}/",
-        "docQualityScore": doc_score,
-        "updatedAtUtc": ts,
-        "version": VERSION,
-    })
-
-    # Firestore status
-    fs.collection("documents").document(doc_id).set({
+    # Firestore mark done
+    doc_ref.set({
         "status": "DOCAI_DONE",
         "docai": {
-            "outputPrefix": f"gs://{DOCAI_OUT_BUCKET}/{run_prefix}/",
-            "latestPrefix": f"gs://{DOCAI_OUT_BUCKET}/{latest_prefix}/",
+            "outputPrefix": f"gs://{DOCAI_OUT_BUCKET}/{prefix}/",
             "docQualityScore": doc_score,
             "pages": pages,
             "processor": DOCAI_PROCESSOR,
             "finishedAtUtc": _utc_ts(),
-            "lockUntilUtc": None,
-            "version": VERSION,
         },
         "updatedAt": firestore.SERVER_TIMESTAMP,
     }, merge=True)
 
-    # Publish downstream event (results)
+    # Publish results message (downstream)
     out_msg = {
         "docId": doc_id,
-        "docaiOutputPrefix": f"gs://{DOCAI_OUT_BUCKET}/{run_prefix}/",
-        "docaiLatestPrefix": f"gs://{DOCAI_OUT_BUCKET}/{latest_prefix}/",
+        "docaiOutputPrefix": f"gs://{DOCAI_OUT_BUCKET}/{prefix}/",
         "docQualityScore": doc_score,
         "canonicalGcsUri": canonical_gcs_uri,
-        "version": VERSION,
     }
     publisher.publish(topic_path, json.dumps(out_msg).encode("utf-8"))
 
-    print(f"OK docId={doc_id} docScore={doc_score} pages={len(pages)} run=gs://{DOCAI_OUT_BUCKET}/{run_prefix}/")
+    print(f"OK docId={doc_id} docScore={doc_score} pages={len(pages)} out=gs://{DOCAI_OUT_BUCKET}/{prefix}/")
     return ("ok", 200)
+
 
 @functions_framework.http
 def docai_runner(request: Request):
+    """
+    IMPORTANT behavior for Pub/Sub PUSH:
+      - On SUCCESS -> return 200 so Pub/Sub stops retrying.
+      - On MALFORMED/UNRECOGNIZED payload -> return 200 (ACK) to prevent poison-message retry loops.
+      - On REAL processing failure -> return 500 so Pub/Sub retries.
+
+    For direct/manual requests (not Pub/Sub), we return 400 on bad payload.
+    """
     try:
-        # Health / version check
         if request.method == "GET":
-            return (f"OK {VERSION}", 200)
+            return ("OK", 200)
 
-        # Helpful log line (shows in Cloud Run logs)
-        print("VERSION:", VERSION, "content_type:", request.content_type, "content_length:", request.content_length)
-
-        job, err, is_pubsub_like, pubsub_message_id = _extract_job_from_http_request(request)
+        job, err, is_pubsub_like = _extract_job_from_http_request(request)
 
         if err:
             msg = f"BAD REQUEST: {err}"
             print(msg)
-            return (msg, 200) if is_pubsub_like else (msg, 400)
 
+            # ACK malformed Pub/Sub / CloudEvent deliveries to stop retries
+            if is_pubsub_like:
+                return (msg, 200)
+
+            # For direct calls, reflect as 400
+            return (msg, 400)
+
+        # Validate required fields
         if "docId" not in job or "canonicalGcsUri" not in job:
             msg = "BAD REQUEST: missing docId/canonicalGcsUri"
             print(msg)
-            return (msg, 200) if is_pubsub_like else (msg, 400)
+            if is_pubsub_like:
+                return (msg, 200)
+            return (msg, 400)
 
-        print(f"Received job docId={job.get('docId')} canonical={job.get('canonicalGcsUri')} msgId={pubsub_message_id}")
-        return _process_job(job, pubsub_message_id)
+        print(f"Received job docId={job.get('docId')} canonical={job.get('canonicalGcsUri')}")
+        return _process_job(job)
 
     except Exception as e:
+        # This is a real failure: return 500 so Pub/Sub retries
         print(f"ERROR processing job: {e}")
         print(traceback.format_exc())
 
-        # Best-effort mark failed if we can infer docId
+        # Best-effort: if we can infer docId, mark failed
         try:
             body, _ = _parse_json_body(request)
             body = body or {}
             work = _unwrap_cloudevent_if_needed(body) if isinstance(body, dict) else {}
+            # try direct
             doc_id = work.get("docId")
-
             if not doc_id and isinstance(work.get("message"), dict):
                 j, _ = _decode_pubsub_data_to_job(work["message"])
                 if isinstance(j, dict):
                     doc_id = j.get("docId")
-
             if doc_id:
-                _mark_failed(doc_id, str(e))
+                _fail_firestore(doc_id, "DOCAI_FAILED", str(e))
         except Exception:
             pass
 

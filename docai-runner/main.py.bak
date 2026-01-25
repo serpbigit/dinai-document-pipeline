@@ -1,0 +1,198 @@
+import base64
+import json
+import os
+from datetime import datetime, timezone
+from typing import Any, Dict, Tuple, Optional
+
+import functions_framework
+from google.cloud import documentai_v1 as documentai
+from google.cloud import firestore
+from google.cloud import storage
+from google.cloud import pubsub_v1
+from google.protobuf.json_format import MessageToDict
+
+# =========================
+# Environment
+# =========================
+PROJECT_ID = os.environ["PROJECT_ID"]
+DOCAI_LOCATION = os.environ.get("DOCAI_LOCATION", "us")  # e.g. "us"
+DOCAI_PROCESSOR = os.environ["DOCAI_PROCESSOR"]          # full resource name
+DOCAI_RESULTS_TOPIC = os.environ["DOCAI_RESULTS_TOPIC"]
+DOCAI_OUT_BUCKET = os.environ["DOCAI_OUT_BUCKET"]
+
+storage_client = storage.Client()
+fs = firestore.Client(project=PROJECT_ID)
+publisher = pubsub_v1.PublisherClient()
+topic_path = publisher.topic_path(PROJECT_ID, DOCAI_RESULTS_TOPIC)
+
+# =========================
+# Helpers
+# =========================
+
+def _compute_page_scores_from_document_layout(doc_like: dict):
+    layout = doc_like.get("documentLayout") or {}
+    blocks = layout.get("blocks") or []
+
+    pages = {}
+    for b in blocks:
+        span = b.get("pageSpan") or {}
+        p = span.get("pageStart")
+        if not p:
+            continue
+        txt = ((b.get("textBlock") or {}).get("text")) or ""
+        pages.setdefault(p, {"page": p, "textLen": 0, "numBlocks": 0})
+        pages[p]["textLen"] += len(txt)
+        pages[p]["numBlocks"] += 1
+
+    results = []
+    for p in sorted(pages.keys()):
+        tl = pages[p]["textLen"]
+        nb = pages[p]["numBlocks"]
+        s_len = min(1.0, tl / 3000.0)
+        s_blk = min(1.0, nb / 10.0)
+        score = round(s_len * s_blk, 4)
+
+        flags = []
+        if tl < 50:
+            flags.append("empty_or_near_empty")
+
+        results.append({
+            "page": p,
+            "score": score,
+            "textLen": tl,
+            "numBlocks": nb,
+            "flags": flags,
+        })
+
+    if not results:
+        return [], 0.0
+
+    doc_score = round(sum(r["score"] for r in results) / len(results), 4)
+    return results, doc_score
+
+
+def _write_json_to_gcs(prefix: str, obj_name: str, payload: dict):
+    b = storage_client.bucket(DOCAI_OUT_BUCKET)
+    blob = b.blob(f"{prefix}/{obj_name}")
+    blob.upload_from_string(
+        json.dumps(payload, ensure_ascii=False),
+        content_type="application/json",
+    )
+
+
+def _extract_job_from_http_request(request) -> Tuple[Optional[Dict[str, Any]], str]:
+    """
+    Supports:
+    1) Pub/Sub push JSON envelope:
+       { "message": { "data": "<base64-json>" , ... }, "subscription": "..." }
+    2) Direct JSON job (manual publish/test):
+       { "docId": "...", "canonicalGcsUri": "...", ... }
+    3) CloudEvent-style body (if ever used), where payload is under "data".
+    """
+    payload = request.get_json(silent=True)
+
+    if payload is None:
+        raw = request.get_data()
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return None, "Request body is not valid JSON"
+
+    if isinstance(payload, dict) and "data" in payload and isinstance(payload["data"], dict):
+        payload = payload["data"]
+
+    if isinstance(payload, dict) and "message" in payload and isinstance(payload["message"], dict):
+        msg = payload["message"]
+        b64 = msg.get("data")
+        if not b64:
+            return None, "Pub/Sub envelope missing message.data"
+
+        try:
+            decoded = base64.b64decode(b64).decode("utf-8")
+            job = json.loads(decoded)
+            if not isinstance(job, dict):
+                return None, "Decoded Pub/Sub message is not a JSON object"
+            return job, ""
+        except Exception as e:
+            return None, f"Failed to decode Pub/Sub message.data: {e}"
+
+    if isinstance(payload, dict) and "docId" in payload and "canonicalGcsUri" in payload:
+        return payload, ""
+
+    return None, "Unrecognized payload format"
+
+
+def _process_job(job: Dict[str, Any]) -> Tuple[str, int]:
+    doc_id = job["docId"]
+    canonical_gcs_uri = job["canonicalGcsUri"]
+
+    doc_ref = fs.collection("documents").document(doc_id)
+    doc_ref.set({"status": "DOCAI_RUNNING", "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+
+    client = documentai.DocumentProcessorServiceClient()
+    req = documentai.ProcessRequest(
+        name=DOCAI_PROCESSOR,
+        gcs_document=documentai.GcsDocument(
+            gcs_uri=canonical_gcs_uri,
+            mime_type="application/pdf",
+        ),
+    )
+
+    result = client.process_document(request=req)
+
+    doc_dict = MessageToDict(result.document._pb, preserving_proto_field_name=True)
+
+    pages, doc_score = _compute_page_scores_from_document_layout(doc_dict)
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    prefix = f"{doc_id}/{ts}"
+
+    _write_json_to_gcs(prefix, "docai_document.json", doc_dict)
+
+    manifest = {
+        "docId": doc_id,
+        "canonicalGcsUri": canonical_gcs_uri,
+        "rawGcsUri": job.get("rawGcsUri"),
+        "processor": DOCAI_PROCESSOR,
+        "createdAtUtc": ts,
+        "docQualityScore": doc_score,
+    }
+    _write_json_to_gcs(prefix, "manifest.json", manifest)
+
+    doc_ref.set({
+        "status": "DOCAI_DONE",
+        "docai": {
+            "outputPrefix": f"gs://{DOCAI_OUT_BUCKET}/{prefix}/",
+            "docQualityScore": doc_score,
+            "pages": pages,
+            "processor": DOCAI_PROCESSOR,
+        },
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }, merge=True)
+
+    out_msg = {
+        "docId": doc_id,
+        "docaiOutputPrefix": f"gs://{DOCAI_OUT_BUCKET}/{prefix}/",
+        "docQualityScore": doc_score,
+        "canonicalGcsUri": canonical_gcs_uri,
+    }
+    publisher.publish(topic_path, json.dumps(out_msg).encode("utf-8"))
+
+    print(f"OK docId={doc_id} docScore={doc_score} pages={len(pages)} out=gs://{DOCAI_OUT_BUCKET}/{prefix}/")
+    return ("ok", 200)
+
+
+@functions_framework.http
+def docai_runner(request):
+    try:
+        job, err = _extract_job_from_http_request(request)
+        if err:
+            print(f"BAD REQUEST: {err}")
+            return (err, 400)
+
+        print(f"Received job docId={job.get('docId')} canonical={job.get('canonicalGcsUri')}")
+        return _process_job(job)
+
+    except Exception as e:
+        print(f"ERROR processing job: {e}")
+        return ("internal error", 500)
