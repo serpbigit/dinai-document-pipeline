@@ -12,6 +12,11 @@ from google.cloud import firestore
 from google.cloud import pubsub_v1
 from google.cloud import storage
 
+# =============================================================================
+# VERSION
+# =============================================================================
+VERSION = "2026-01-25T-ingest-AtoZ-v2-case+unicode-filename+better-metadata"
+
 # =========================
 # Environment
 # =========================
@@ -34,7 +39,7 @@ topic_path = publisher.topic_path(PROJECT_ID, DOCAI_REQUESTS_TOPIC)
 def _ascii_safe_name(filename: str) -> str:
     """
     Turn any filename into an ASCII-safe version while keeping the extension.
-    NOTE: this is used only for canonical naming; we always preserve the original unicode name in Firestore.
+    NOTE: used only for canonical naming; we always preserve the original unicode name in Firestore.
     """
     if "." in filename:
         base, ext = filename.rsplit(".", 1)
@@ -51,7 +56,6 @@ def _ascii_safe_name(filename: str) -> str:
 
     return norm[:120] + ext
 
-
 def _sha256_gcs(bucket: str, name: str) -> str:
     b = storage_client.bucket(bucket)
     blob = b.blob(name)
@@ -60,7 +64,6 @@ def _sha256_gcs(bucket: str, name: str) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
-
 
 def _parse_eventarc_cloudevent(request):
     """
@@ -84,7 +87,6 @@ def _parse_eventarc_cloudevent(request):
 
     except Exception as e:
         return None, str(e)
-
 
 def _infer_case(inbox_object_name: str) -> str:
     """
@@ -135,7 +137,6 @@ def ingest_etl(request):
         print(f"Ignoring placeholder object: {name}")
         return ("ignored", 200)
 
-    # Derive case + original (unicode) filename
     case = _infer_case(name)
     original_filename = os.path.basename(name)  # unicode-safe (Hebrew preserved)
     ascii_safe = _ascii_safe_name(original_filename)
@@ -195,6 +196,10 @@ def ingest_etl(request):
             "case": case,
             "sizeBytes": size,
             "contentType": content_type,
+            "ingest": {
+                "version": VERSION,
+                "atUtc": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+            },
             "original": {
                 "gcsUri": raw_gcs_uri,
                 "filenameOriginal": original_filename,   # unicode (Hebrew preserved)
@@ -213,7 +218,7 @@ def ingest_etl(request):
         }
     )
 
-    # Publish to docai-runner
+    # Publish to docai-runner (preserve unicode fields)
     msg = {
         "docId": doc_id,
         "case": case,
@@ -227,6 +232,7 @@ def ingest_etl(request):
         "originalInboxObject": name,
         "sizeBytes": size,
         "contentType": content_type,
+        "ingestVersion": VERSION,
     }
 
     publisher.publish(topic_path, json.dumps(msg, ensure_ascii=False).encode("utf-8"))

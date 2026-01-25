@@ -9,6 +9,7 @@ import functions_framework
 from flask import Request
 
 from google.api_core import exceptions as gexceptions
+from google.api_core import operation as ga_operation
 from google.cloud import documentai_v1 as documentai
 from google.cloud import firestore
 from google.cloud import storage
@@ -18,7 +19,7 @@ from google.protobuf.json_format import MessageToDict
 # =============================================================================
 # VERSION (change this string every deploy to confirm you're running the right code)
 # =============================================================================
-VERSION = "2026-01-25T-mainpy-AtoZ-v2-batch-fallback+scorefix"
+VERSION = "2026-01-25T-mainpy-AtoZ-v3-batch-submit+poller+no-retry-storms"
 
 # =============================================================================
 # Environment (required)
@@ -31,8 +32,15 @@ DOCAI_OUT_BUCKET = os.environ["DOCAI_OUT_BUCKET"]        # bucket name, without 
 # Lock settings (prevents concurrent duplicates + handles Pub/Sub at-least-once)
 LOCK_MINUTES = int(os.environ.get("DOCAI_LOCK_MINUTES", "15"))
 
-# How long we'll wait for batch operation before marking failed (Cloud Run HTTP can be long, but don't hang forever)
-BATCH_TIMEOUT_SECONDS = int(os.environ.get("DOCAI_BATCH_TIMEOUT_SECONDS", "3300"))  # 55 minutes default
+# Batch behavior:
+# - For large PDFs (online page limit), we SUBMIT batch and ACK immediately by default.
+# - If you really want to wait in-request (not recommended), set DOCAI_BATCH_WAIT=1
+BATCH_WAIT = os.environ.get("DOCAI_BATCH_WAIT", "0").strip() == "1"
+BATCH_WAIT_SECONDS = int(os.environ.get("DOCAI_BATCH_WAIT_SECONDS", "3300"))  # 55 minutes default
+
+# Polling:
+# When poll=1 is called, we attempt to finalize up to N batch-running docs.
+DEFAULT_POLL_LIMIT = int(os.environ.get("DOCAI_POLL_LIMIT", "25"))
 
 # =============================================================================
 # Clients (module-level reuse)
@@ -136,26 +144,15 @@ def _extract_job_from_http_request(request: Request) -> Tuple[Optional[Dict[str,
 
     return None, "Unrecognized payload format", is_pubsub_like, None
 
-def _get_nested(d: dict, *keys, default=None):
-    cur = d
-    for k in keys:
-        if not isinstance(cur, dict):
-            return default
-        if k not in cur:
-            return default
-        cur = cur[k]
-    return cur
-
 def _compute_page_scores_from_document_layout(doc_like: dict):
     """
     Lightweight heuristic "quality-ish" scoring using Document Layout blocks.
     This is NOT DocAI confidence; it's a signal: more extracted text + more blocks => higher score.
 
-    IMPORTANT: supports both camelCase and snake_case shapes.
+    Supports both:
+      - documentLayout / textBlock / pageSpan
+      - document_layout / text_block / page_span
     """
-    # doc_like may contain:
-    #  - documentLayout { blocks: [ { textBlock { text }, pageSpan {...}}]}
-    #  - document_layout { blocks: [ { text_block { text }, page_span {...}}]}
     layout = doc_like.get("documentLayout") or doc_like.get("document_layout") or {}
     blocks = layout.get("blocks") or []
 
@@ -207,6 +204,28 @@ def _write_json_to_gcs(prefix: str, obj_name: str, payload: dict):
     blob = b.blob(f"{prefix}/{obj_name}")
     blob.upload_from_string(json.dumps(payload, ensure_ascii=False), content_type="application/json")
 
+def _gcs_list(prefix_uri: str) -> List[str]:
+    """
+    prefix_uri: gs://bucket/prefix/...
+    returns list of full gs:// URIs
+    """
+    if not prefix_uri.startswith("gs://"):
+        return []
+    rest = prefix_uri[5:]
+    bucket, _, prefix = rest.partition("/")
+    b = storage_client.bucket(bucket)
+    return [f"gs://{bucket}/{blob.name}" for blob in b.list_blobs(prefix=prefix)]
+
+def _gcs_read_json(gcs_uri: str) -> dict:
+    if not gcs_uri.startswith("gs://"):
+        raise ValueError("gcs_uri must start with gs://")
+    rest = gcs_uri[5:]
+    bucket, _, name = rest.partition("/")
+    b = storage_client.bucket(bucket)
+    blob = b.blob(name)
+    data = blob.download_as_bytes()
+    return json.loads(data.decode("utf-8"))
+
 def _mark_failed(doc_id: str, error: str, mode: str, extra: Optional[dict] = None):
     data = {
         "status": "DOCAI_FAILED",
@@ -224,6 +243,30 @@ def _mark_failed(doc_id: str, error: str, mode: str, extra: Optional[dict] = Non
         data["docai"].update(extra)
 
     fs.collection("documents").document(doc_id).set(data, merge=True)
+
+def _mark_batch_running(doc_id: str, op_name: str, batch_output_prefix: str, canonical_gcs_uri: str, pubsub_message_id: Optional[str]):
+    fs.collection("documents").document(doc_id).set({
+        "status": "DOCAI_BATCH_RUNNING",
+        "docai": {
+            "processor": DOCAI_PROCESSOR,
+            "mode": "batch",
+            "batchOperationName": op_name,
+            "batchOutputPrefix": batch_output_prefix,
+            "canonicalGcsUri": canonical_gcs_uri,
+            "submittedAtUtc": _utc_ts(),
+            "lastPubsubMessageId": pubsub_message_id,
+            "lockUntilUtc": None,
+            "version": VERSION,
+        },
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }, merge=True)
+
+def _is_page_limit_exceeded(err: Exception) -> bool:
+    msg = str(err) or ""
+    return ("PAGE_LIMIT_EXCEEDED" in msg) or ("pages exceed the limit" in msg.lower())
+
+def _is_permanent_invalid_argument(err: Exception) -> bool:
+    return isinstance(err, gexceptions.InvalidArgument)
 
 def _claim_lock_or_skip(doc_id: str, pubsub_message_id: Optional[str]) -> Tuple[bool, str]:
     """
@@ -248,6 +291,10 @@ def _claim_lock_or_skip(doc_id: str, pubsub_message_id: Optional[str]) -> Tuple[
 
         if status == "DOCAI_DONE":
             return False, "already_done"
+
+        # If we already submitted batch for this doc, don't keep re-submitting.
+        if status == "DOCAI_BATCH_RUNNING":
+            return False, "batch_running"
 
         if pubsub_message_id and last_msg == pubsub_message_id:
             return False, "duplicate_message_id"
@@ -281,28 +328,6 @@ def _claim_lock_or_skip(doc_id: str, pubsub_message_id: Optional[str]) -> Tuple[
     txn = fs.transaction()
     return _txn(txn)
 
-def _gcs_list(prefix_uri: str) -> List[str]:
-    """
-    prefix_uri: gs://bucket/prefix/...
-    returns list of full gs:// URIs
-    """
-    if not prefix_uri.startswith("gs://"):
-        return []
-    rest = prefix_uri[5:]
-    bucket, _, prefix = rest.partition("/")
-    b = storage_client.bucket(bucket)
-    return [f"gs://{bucket}/{blob.name}" for blob in b.list_blobs(prefix=prefix)]
-
-def _gcs_read_json(gcs_uri: str) -> dict:
-    if not gcs_uri.startswith("gs://"):
-        raise ValueError("gcs_uri must start with gs://")
-    rest = gcs_uri[5:]
-    bucket, _, name = rest.partition("/")
-    b = storage_client.bucket(bucket)
-    blob = b.blob(name)
-    data = blob.download_as_bytes()
-    return json.loads(data.decode("utf-8"))
-
 def _docai_online_process_pdf(canonical_gcs_uri: str) -> dict:
     client = documentai.DocumentProcessorServiceClient()
     req = documentai.ProcessRequest(
@@ -312,20 +337,17 @@ def _docai_online_process_pdf(canonical_gcs_uri: str) -> dict:
     result = client.process_document(request=req)
     return MessageToDict(result.document._pb, preserving_proto_field_name=True)
 
-def _docai_batch_process_pdf(canonical_gcs_uri: str, output_gcs_prefix: str) -> Tuple[dict, str, List[str]]:
+def _submit_batch_for_pdf(canonical_gcs_uri: str, output_gcs_prefix: str) -> str:
     """
-    Runs batch_process_documents and returns:
-      (doc_dict, batch_output_prefix_uri, output_file_uris)
+    Submit batch_process_documents and return operation name.
     """
     client = documentai.DocumentProcessorServiceClient()
 
-    # Batch input (single PDF)
     gcs_documents = documentai.GcsDocuments(
         documents=[documentai.GcsDocument(gcs_uri=canonical_gcs_uri, mime_type="application/pdf")]
     )
     input_config = documentai.BatchDocumentsInputConfig(gcs_documents=gcs_documents)
 
-    # Batch output
     gcs_output_config = documentai.DocumentOutputConfig.GcsOutputConfig(gcs_uri=output_gcs_prefix)
     output_config = documentai.DocumentOutputConfig(gcs_output_config=gcs_output_config)
 
@@ -336,108 +358,54 @@ def _docai_batch_process_pdf(canonical_gcs_uri: str, output_gcs_prefix: str) -> 
     )
 
     op = client.batch_process_documents(request=req)
-    op.result(timeout=BATCH_TIMEOUT_SECONDS)
+    # Important: return operation name so we can poll later.
+    return op.operation.name
 
-    # DocAI writes JSON(s) under output_gcs_prefix; find the newest .json and use it.
-    # (There may be one or more files; for single input, expect one document JSON.)
-    out_files = _gcs_list(output_gcs_prefix)
+def _wait_for_operation(op_name: str, timeout_seconds: int) -> None:
+    """
+    Wait for a DocAI long-running operation.
+    """
+    client = documentai.DocumentProcessorServiceClient()
+    op = ga_operation.Operation(
+        client.transport.operations_client,
+        op_name,
+        result_type=None,
+        metadata_type=None,
+    )
+    op.result(timeout=timeout_seconds)
+
+def _pick_batch_output_json(batch_output_prefix: str) -> Tuple[dict, List[str], str]:
+    """
+    DocAI batch output structure typically writes:
+      gs://.../batch_output/<input-name>/.../*.json
+    We'll scan for .json and pick the "best" candidate.
+    """
+    out_files = _gcs_list(batch_output_prefix)
     json_files = [u for u in out_files if u.lower().endswith(".json")]
 
     if not json_files:
-        raise RuntimeError(f"Batch completed but no .json output found under {output_gcs_prefix}")
+        raise RuntimeError(f"Batch finished but no .json output found under {batch_output_prefix}")
 
-    # Prefer a file that looks like the actual document export; otherwise use last lexicographically.
+    # Prefer deeper paths that look like the document export; fallback to lexicographically last.
     json_files_sorted = sorted(json_files)
     chosen = json_files_sorted[-1]
-
     doc_dict = _gcs_read_json(chosen)
-    return doc_dict, output_gcs_prefix, json_files_sorted
+    return doc_dict, json_files_sorted, chosen
 
-def _is_page_limit_exceeded(err: Exception) -> bool:
-    msg = str(err) or ""
-    return ("PAGE_LIMIT_EXCEEDED" in msg) or ("pages exceed the limit" in msg.lower())
-
-def _is_permanent_invalid_argument(err: Exception) -> bool:
-    # InvalidArgument is usually permanent for a given input (page limit, unsupported, bad mime, etc.)
-    return isinstance(err, gexceptions.InvalidArgument)
-
-def _process_job(job: Dict[str, Any], pubsub_message_id: Optional[str]) -> Tuple[str, int]:
-    doc_id = job["docId"]
-    canonical_gcs_uri = job["canonicalGcsUri"]
-
-    proceed, reason = _claim_lock_or_skip(doc_id, pubsub_message_id)
-    if not proceed:
-        print(f"SKIP docId={doc_id} reason={reason} msgId={pubsub_message_id}")
-        return ("ok", 200)
-
+def _finalize_doc(doc_id: str, canonical_gcs_uri: str, pubsub_message_id: Optional[str], doc_dict: dict, mode_used: str,
+                  batch_output_prefix: Optional[str] = None, batch_json_files: Optional[List[str]] = None,
+                  batch_chosen_json: Optional[str] = None):
     ts = _utc_ts()
-
-    # Run history + stable latest pointer
     run_prefix = f"{doc_id}/{ts}"
     latest_prefix = f"{doc_id}/latest"
 
-    mode_used = "online"
-    batch_output_prefix = None
-    batch_json_files = []
-
-    try:
-        # Attempt ONLINE first (fast for small PDFs)
-        doc_dict = _docai_online_process_pdf(canonical_gcs_uri)
-
-    except Exception as e:
-        # If we hit online page-limit, automatically fallback to BATCH.
-        if _is_page_limit_exceeded(e):
-            mode_used = "batch"
-            # DocAI requires output prefix ending with "/"
-            batch_output_prefix = f"gs://{DOCAI_OUT_BUCKET}/{run_prefix}/batch_output/"
-            print(f"PAGE_LIMIT_EXCEEDED -> switching to batch. docId={doc_id} out={batch_output_prefix}")
-
-            try:
-                doc_dict, batch_output_prefix, batch_json_files = _docai_batch_process_pdf(
-                    canonical_gcs_uri=canonical_gcs_uri,
-                    output_gcs_prefix=batch_output_prefix,
-                )
-            except Exception as be:
-                # Batch failed — mark failed and ACK (200) to prevent infinite retries
-                _mark_failed(
-                    doc_id=doc_id,
-                    error=f"batch_failed: {be}",
-                    mode="batch",
-                    extra={
-                        "canonicalGcsUri": canonical_gcs_uri,
-                        "batchOutputPrefix": batch_output_prefix,
-                    },
-                )
-                print(f"ERROR batch processing job: {be}")
-                print(traceback.format_exc())
-                return ("ok", 200)
-
-        else:
-            # If it's InvalidArgument (permanent), mark failed and ACK to stop retries
-            if _is_permanent_invalid_argument(e):
-                _mark_failed(
-                    doc_id=doc_id,
-                    error=f"invalid_argument: {e}",
-                    mode="online",
-                    extra={"canonicalGcsUri": canonical_gcs_uri},
-                )
-                print(f"PERMANENT InvalidArgument -> ACK. docId={doc_id} err={e}")
-                return ("ok", 200)
-
-            # Otherwise treat as transient and re-raise so Pub/Sub retries
-            raise
-
-    # Compute heuristic page scores (now fixed for snake_case)
     pages, doc_score = _compute_page_scores_from_document_layout(doc_dict)
 
-    # Persist the full DocAI document JSON (whatever mode produced it)
     _write_json_to_gcs(run_prefix, "docai_document.json", doc_dict)
 
-    # Manifest includes mode + batch info if relevant
     manifest = {
         "docId": doc_id,
         "canonicalGcsUri": canonical_gcs_uri,
-        "rawGcsUri": job.get("rawGcsUri"),
         "processor": DOCAI_PROCESSOR,
         "createdAtUtc": ts,
         "docQualityScore": doc_score,
@@ -447,7 +415,8 @@ def _process_job(job: Dict[str, Any], pubsub_message_id: Optional[str]) -> Tuple
     }
     if mode_used == "batch":
         manifest["batchOutputPrefix"] = batch_output_prefix
-        manifest["batchJsonFiles"] = batch_json_files
+        manifest["batchJsonFiles"] = batch_json_files or []
+        manifest["batchChosenJson"] = batch_chosen_json
 
     _write_json_to_gcs(run_prefix, "manifest.json", manifest)
 
@@ -460,7 +429,6 @@ def _process_job(job: Dict[str, Any], pubsub_message_id: Optional[str]) -> Tuple
         "mode": mode_used,
     })
 
-    # Firestore status
     fs.collection("documents").document(doc_id).set({
         "status": "DOCAI_DONE",
         "docai": {
@@ -473,11 +441,11 @@ def _process_job(job: Dict[str, Any], pubsub_message_id: Optional[str]) -> Tuple
             "lockUntilUtc": None,
             "version": VERSION,
             "mode": mode_used,
+            "batchOutputPrefix": batch_output_prefix,
         },
         "updatedAt": firestore.SERVER_TIMESTAMP,
     }, merge=True)
 
-    # Publish downstream event (results)
     out_msg = {
         "docId": doc_id,
         "docaiOutputPrefix": f"gs://{DOCAI_OUT_BUCKET}/{run_prefix}/",
@@ -490,16 +458,146 @@ def _process_job(job: Dict[str, Any], pubsub_message_id: Optional[str]) -> Tuple
     publisher.publish(topic_path, json.dumps(out_msg).encode("utf-8"))
 
     print(f"OK docId={doc_id} docScore={doc_score} pages={len(pages)} mode={mode_used} run=gs://{DOCAI_OUT_BUCKET}/{run_prefix}/")
-    return ("ok", 200)
+
+def _process_job(job: Dict[str, Any], pubsub_message_id: Optional[str]) -> Tuple[str, int]:
+    doc_id = job["docId"]
+    canonical_gcs_uri = job["canonicalGcsUri"]
+
+    proceed, reason = _claim_lock_or_skip(doc_id, pubsub_message_id)
+    if not proceed:
+        print(f"SKIP docId={doc_id} reason={reason} msgId={pubsub_message_id}")
+        return ("ok", 200)
+
+    try:
+        # ONLINE attempt first
+        try:
+            doc_dict = _docai_online_process_pdf(canonical_gcs_uri)
+            _finalize_doc(doc_id, canonical_gcs_uri, pubsub_message_id, doc_dict, mode_used="online")
+            return ("ok", 200)
+
+        except Exception as e:
+            # Online page-limit => submit batch
+            if _is_page_limit_exceeded(e):
+                # DocAI requires output prefix ending with "/"
+                batch_output_prefix = f"gs://{DOCAI_OUT_BUCKET}/{doc_id}/{_utc_ts()}/batch_output/"
+                print(f"PAGE_LIMIT_EXCEEDED -> submit batch docId={doc_id} out={batch_output_prefix}")
+
+                op_name = _submit_batch_for_pdf(canonical_gcs_uri, batch_output_prefix)
+                _mark_batch_running(doc_id, op_name, batch_output_prefix, canonical_gcs_uri, pubsub_message_id)
+
+                # If configured, wait here (not recommended). Otherwise ACK now and let poller finalize.
+                if BATCH_WAIT:
+                    print(f"BATCH_WAIT=1 -> waiting for op={op_name} timeout={BATCH_WAIT_SECONDS}s")
+                    _wait_for_operation(op_name, BATCH_WAIT_SECONDS)
+                    doc_dict, batch_json_files, chosen = _pick_batch_output_json(batch_output_prefix)
+                    _finalize_doc(
+                        doc_id, canonical_gcs_uri, pubsub_message_id,
+                        doc_dict, mode_used="batch",
+                        batch_output_prefix=batch_output_prefix,
+                        batch_json_files=batch_json_files,
+                        batch_chosen_json=chosen
+                    )
+                else:
+                    print(f"Submitted batch op={op_name} (ACK now; finalize via poll=1)")
+
+                return ("ok", 200)
+
+            # Permanent InvalidArgument -> mark failed + ACK so Pub/Sub stops retry storms
+            if _is_permanent_invalid_argument(e):
+                _mark_failed(doc_id, f"invalid_argument: {e}", mode="online", extra={"canonicalGcsUri": canonical_gcs_uri})
+                print(f"PERMANENT InvalidArgument -> ACK docId={doc_id} err={e}")
+                return ("ok", 200)
+
+            # Transient -> re-raise -> 500 causes Pub/Sub retry
+            raise
+
+    except Exception as e:
+        print(f"ERROR processing job: {e}")
+        print(traceback.format_exc())
+        return ("internal error", 500)
+
+def _poll_finalize(limit: int) -> Dict[str, Any]:
+    """
+    Finalize completed batch operations.
+    Finds documents with status=DOCAI_BATCH_RUNNING and attempts to finalize up to 'limit'.
+    """
+    client = documentai.DocumentProcessorServiceClient()
+
+    q = fs.collection("documents").where("status", "==", "DOCAI_BATCH_RUNNING").limit(limit)
+    snaps = list(q.stream())
+
+    finalized = 0
+    still_running = 0
+    failed = 0
+    details = []
+
+    for snap in snaps:
+        doc_id = snap.id
+        data = snap.to_dict() or {}
+        docai = data.get("docai") or {}
+        op_name = docai.get("batchOperationName")
+        batch_output_prefix = docai.get("batchOutputPrefix")
+        canonical_gcs_uri = docai.get("canonicalGcsUri") or docai.get("canonicalGcsUri".lower())
+
+        if not op_name or not batch_output_prefix or not canonical_gcs_uri:
+            failed += 1
+            _mark_failed(doc_id, "batch_poll_missing_fields", mode="batch", extra={"docai": docai})
+            details.append({"docId": doc_id, "status": "failed_missing_fields"})
+            continue
+
+        try:
+            op = ga_operation.Operation(
+                client.transport.operations_client,
+                op_name,
+                result_type=None,
+                metadata_type=None,
+            )
+
+            if not op.done():
+                still_running += 1
+                details.append({"docId": doc_id, "status": "running", "op": op_name})
+                continue
+
+            # Done: read output JSON and finalize
+            doc_dict, batch_json_files, chosen = _pick_batch_output_json(batch_output_prefix)
+            _finalize_doc(
+                doc_id, canonical_gcs_uri, pubsub_message_id=None,
+                doc_dict=doc_dict, mode_used="batch",
+                batch_output_prefix=batch_output_prefix,
+                batch_json_files=batch_json_files,
+                batch_chosen_json=chosen
+            )
+            finalized += 1
+            details.append({"docId": doc_id, "status": "finalized", "chosen": chosen})
+
+        except Exception as e:
+            # If the operation failed permanently, mark failed and move on (ACK behavior)
+            failed += 1
+            _mark_failed(doc_id, f"batch_poll_error: {e}", mode="batch", extra={"operationName": op_name, "batchOutputPrefix": batch_output_prefix})
+            details.append({"docId": doc_id, "status": "failed", "err": str(e)})
+
+    return {
+        "version": VERSION,
+        "limit": limit,
+        "finalized": finalized,
+        "still_running": still_running,
+        "failed": failed,
+        "details": details[:50],
+    }
 
 @functions_framework.http
 def docai_runner(request: Request):
     try:
+        # Poll endpoint (use this to finalize batch jobs overnight)
+        if request.method == "GET" and request.args.get("poll") == "1":
+            limit = int(request.args.get("limit") or DEFAULT_POLL_LIMIT)
+            report = _poll_finalize(limit)
+            return (json.dumps(report, ensure_ascii=False), 200, {"Content-Type": "application/json"})
+
         # Health / version check
         if request.method == "GET":
             return (f"OK {VERSION}", 200)
 
-        # Helpful log line (shows in Cloud Run logs)
         print("VERSION:", VERSION, "content_type:", request.content_type, "content_length:", request.content_length)
 
         job, err, is_pubsub_like, pubsub_message_id = _extract_job_from_http_request(request)
@@ -518,10 +616,10 @@ def docai_runner(request: Request):
         return _process_job(job, pubsub_message_id)
 
     except Exception as e:
-        print(f"ERROR processing job: {e}")
+        print(f"ERROR processing request: {e}")
         print(traceback.format_exc())
 
-        # Best-effort mark failed if we can infer docId, but ACK InvalidArgument to avoid retry storms
+        # Best-effort mark failed if we can infer docId, and ACK InvalidArgument to avoid retry storms
         try:
             body, _ = _parse_json_body(request)
             body = body or {}
@@ -533,13 +631,10 @@ def docai_runner(request: Request):
                 if isinstance(j, dict):
                     doc_id = j.get("docId")
 
-            if doc_id:
-                if _is_permanent_invalid_argument(e):
-                    _mark_failed(doc_id, f"invalid_argument: {e}", mode="unknown")
-                    return ("ok", 200)
-                _mark_failed(doc_id, str(e), mode="unknown")
+            if doc_id and _is_permanent_invalid_argument(e):
+                _mark_failed(doc_id, f"invalid_argument: {e}", mode="unknown")
+                return ("ok", 200)
         except Exception:
             pass
 
-        # transient -> 500 lets Pub/Sub retry
         return ("internal error", 500)
