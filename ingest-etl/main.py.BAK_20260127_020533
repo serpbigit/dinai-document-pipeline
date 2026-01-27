@@ -15,7 +15,7 @@ from google.cloud import storage
 # =============================================================================
 # VERSION
 # =============================================================================
-VERSION = "2026-01-27T-ingest-AtoZ-v3-case-rooted-docai-prefix+link-index-contract"
+VERSION = "2026-01-25T-ingest-AtoZ-v2-case+unicode-filename+better-metadata"
 
 # =========================
 # Environment
@@ -27,10 +27,6 @@ RAW_BUCKET = os.environ["RAW_BUCKET"]
 CANONICAL_BUCKET = os.environ["CANONICAL_BUCKET"]
 DOCAI_REQUESTS_TOPIC = os.environ["DOCAI_REQUESTS_TOPIC"]
 
-# Optional override; default matches your naming convention:
-# dinai-tenant-internal-001 -> dinai-tenant-internal-001-docai-out
-DOCAI_OUT_BUCKET = os.environ.get("DOCAI_OUT_BUCKET", f"{PROJECT_ID}-docai-out")
-
 storage_client = storage.Client()
 fs = firestore.Client(project=PROJECT_ID)
 publisher = pubsub_v1.PublisherClient()
@@ -39,10 +35,6 @@ topic_path = publisher.topic_path(PROJECT_ID, DOCAI_REQUESTS_TOPIC)
 # =========================
 # Helpers
 # =========================
-
-def _utc_run_id() -> str:
-    """UTC run id suitable for folder prefixes."""
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 def _ascii_safe_name(filename: str) -> str:
     """
@@ -106,17 +98,6 @@ def _infer_case(inbox_object_name: str) -> str:
         first = inbox_object_name.split("/", 1)[0].strip()
         return first if first else "_default"
     return "_default"
-
-def _docai_case_prefix(case: str) -> str:
-    # Case-rooted prefix (runner can place job subfolders under this)
-    return f"gs://{DOCAI_OUT_BUCKET}/{case}/"
-
-def _docai_run_prefix(case: str, run_id: str) -> str:
-    # Run-rooted prefix (preferred: all outputs for this run stay under the run folder)
-    return f"gs://{DOCAI_OUT_BUCKET}/{case}/{run_id}/"
-
-def _docai_latest_link_index_uri(case: str) -> str:
-    return f"gs://{DOCAI_OUT_BUCKET}/{case}/latest/link_index.jsonl"
 
 # =========================
 # Entry point
@@ -207,10 +188,6 @@ def ingest_etl(request):
     canonical_gcs_uri = f"gs://{CANONICAL_BUCKET}/{canonical_path}"
     raw_gcs_uri = f"gs://{RAW_BUCKET}/{raw_path}"
 
-    # Prepare a run id for downstream batch grouping.
-    # Runner may override / group multiple docs into a single run; still we provide a deterministic default.
-    run_id = _utc_run_id()
-
     # Persist metadata for provenance + monitoring
     doc_ref.set(
         {
@@ -222,7 +199,6 @@ def ingest_etl(request):
             "ingest": {
                 "version": VERSION,
                 "atUtc": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
-                "runId": run_id,
             },
             "original": {
                 "gcsUri": raw_gcs_uri,
@@ -236,12 +212,6 @@ def ingest_etl(request):
                 "object": canonical_path,
                 "bucket": CANONICAL_BUCKET,
             },
-            "docai": {
-                "outBucket": DOCAI_OUT_BUCKET,
-                "casePrefix": _docai_case_prefix(case),
-                "runPrefix": _docai_run_prefix(case, run_id),
-                "latestLinkIndexUri": _docai_latest_link_index_uri(case),
-            },
             "status": "CANONICALIZED",
             "createdAt": firestore.SERVER_TIMESTAMP,
             "updatedAt": firestore.SERVER_TIMESTAMP,
@@ -249,54 +219,23 @@ def ingest_etl(request):
     )
 
     # Publish to docai-runner (preserve unicode fields)
-    # IMPORTANT CONTRACT:
-    # - sourcePdfUri must remain the PDF we will open in the viewer / cite (canonical).
-    # - docaiOut* tells runner where to place outputs so provenance is case-rooted.
-    # - latestLinkIndexUri tells runner where to append/update durable mapping JSONL.
     msg = {
         "docId": doc_id,
         "case": case,
-        "runId": run_id,
-
-        # The PDF we want Search/RAG citations to open (stable path)
-        "sourcePdfUri": canonical_gcs_uri,
-
-        # Canonical
         "canonicalGcsUri": canonical_gcs_uri,
         "canonicalObject": canonical_path,
         "canonicalBucket": CANONICAL_BUCKET,
-
-        # Raw provenance
         "rawGcsUri": raw_gcs_uri,
         "rawObject": raw_path,
         "rawBucket": RAW_BUCKET,
-
-        # Original / inbox
         "originalFilename": original_filename,
         "originalInboxObject": name,
-
-        # Sizing
         "sizeBytes": size,
         "contentType": content_type,
-
-        # Output routing for DocAI (runner uses these to set gcs_output_uri_prefix)
-        "docaiOutBucket": DOCAI_OUT_BUCKET,
-        "docaiCasePrefix": _docai_case_prefix(case),     # gs://.../<case>/
-        "docaiRunPrefix": _docai_run_prefix(case, run_id),  # gs://.../<case>/<runId>/
-        "latestLinkIndexUri": _docai_latest_link_index_uri(case),
-
-        # Versioning
         "ingestVersion": VERSION,
     }
 
     publisher.publish(topic_path, json.dumps(msg, ensure_ascii=False).encode("utf-8"))
 
-    print(
-        "OK "
-        f"docId={doc_id} "
-        f"case={case} "
-        f"runId={run_id} "
-        f"canonical={canonical_gcs_uri} "
-        f"original={original_filename}"
-    )
+    print(f"OK docId={doc_id} case={case} canonical={canonical_gcs_uri} original={original_filename}")
     return ("ok", 200)

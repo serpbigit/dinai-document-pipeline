@@ -1,0 +1,53 @@
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:101: def _decode_pubsub_data_to_job(message: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str]:
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:127:         return None, err, _is_pubsub_like_request(request, None), None
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:13: from google.cloud import documentai_v1 as documentai
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:130:     is_pubsub_like = _is_pubsub_like_request(request, body) or _is_pubsub_like_request(request, working)
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:136:         job, derr = _decode_pubsub_data_to_job(msg)
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:143:         return working, "", is_pubsub_like, None
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:145:     return None, "Unrecognized payload format", is_pubsub_like, None
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:16: from google.cloud import pubsub_v1
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:247: def _mark_batch_running(doc_id: str, op_name: str, batch_output_prefix: str, canonical_gcs_uri: str, pubsub_message_id: Optional[str]):
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:257:             "lastPubsubMessageId": pubsub_message_id,
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:271: def _claim_lock_or_skip(doc_id: str, pubsub_message_id: Optional[str]) -> Tuple[bool, str]:
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:275:       - If same pubsub_message_id already processed -> skip
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:288:         last_msg = docai.get("lastPubsubMessageId")
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:299:         if pubsub_message_id and last_msg == pubsub_message_id:
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:322:         if pubsub_message_id:
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:323:             update["docai"]["lastPubsubMessageId"] = pubsub_message_id
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:332:     client = documentai.DocumentProcessorServiceClient()
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:333:     req = documentai.ProcessRequest(
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:335:         gcs_document=documentai.GcsDocument(gcs_uri=canonical_gcs_uri, mime_type="application/pdf"),
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:342:     Submit batch_process_documents and return operation name.
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:344:     client = documentai.DocumentProcessorServiceClient()
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:346:     gcs_documents = documentai.GcsDocuments(
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:347:         documents=[documentai.GcsDocument(gcs_uri=canonical_gcs_uri, mime_type="application/pdf")]
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:349:     input_config = documentai.BatchDocumentsInputConfig(gcs_documents=gcs_documents)
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:351:     gcs_output_config = documentai.DocumentOutputConfig.GcsOutputConfig(gcs_uri=output_gcs_prefix)
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:352:     output_config = documentai.DocumentOutputConfig(gcs_output_config=gcs_output_config)
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:354:     req = documentai.BatchProcessRequest(
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:357:         document_output_config=output_config,
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:360:     op = client.batch_process_documents(request=req)
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:368:     client = documentai.DocumentProcessorServiceClient()
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:395: def _finalize_doc(doc_id: str, canonical_gcs_uri: str, pubsub_message_id: Optional[str], doc_dict: dict, mode_used: str,
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:412:         "pubsubMessageId": pubsub_message_id,
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:462: def _process_job(job: Dict[str, Any], pubsub_message_id: Optional[str]) -> Tuple[str, int]:
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:466:     proceed, reason = _claim_lock_or_skip(doc_id, pubsub_message_id)
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:468:         print(f"SKIP docId={doc_id} reason={reason} msgId={pubsub_message_id}")
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:475:             _finalize_doc(doc_id, canonical_gcs_uri, pubsub_message_id, doc_dict, mode_used="online")
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:486:                 _mark_batch_running(doc_id, op_name, batch_output_prefix, canonical_gcs_uri, pubsub_message_id)
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:494:                         doc_id, canonical_gcs_uri, pubsub_message_id,
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:50: publisher = pubsub_v1.PublisherClient()
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:524:     client = documentai.DocumentProcessorServiceClient()
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:564:                 doc_id, canonical_gcs_uri, pubsub_message_id=None,
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:603:         job, err, is_pubsub_like, pubsub_message_id = _extract_job_from_http_request(request)
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:608:             return (msg, 200) if is_pubsub_like else (msg, 400)
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:613:             return (msg, 200) if is_pubsub_like else (msg, 400)
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:615:         print(f"Received job docId={job.get('docId')} canonical={job.get('canonicalGcsUri')} msgId={pubsub_message_id}")
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:616:         return _process_job(job, pubsub_message_id)
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:63: def _is_pubsub_like_request(request: Request, body: Optional[dict]) -> bool:
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py:630:                 j, _ = _decode_pubsub_data_to_job(work["message"])
+C:\Users\reuve\dinai-document-pipeline\ingest-etl\main.py:12: from google.cloud import pubsub_v1
+C:\Users\reuve\dinai-document-pipeline\ingest-etl\main.py:28: DOCAI_REQUESTS_TOPIC = os.environ["DOCAI_REQUESTS_TOPIC"]
+C:\Users\reuve\dinai-document-pipeline\ingest-etl\main.py:282:         # Output routing for DocAI (runner uses these to set gcs_output_uri_prefix)
+C:\Users\reuve\dinai-document-pipeline\ingest-etl\main.py:36: publisher = pubsub_v1.PublisherClient()
+C:\Users\reuve\dinai-document-pipeline\ingest-etl\main.py:37: topic_path = publisher.topic_path(PROJECT_ID, DOCAI_REQUESTS_TOPIC)

@@ -1,0 +1,2 @@
+C:\Users\reuve\dinai-document-pipeline\docai-runner\main.py
+C:\Users\reuve\dinai-document-pipeline\ingest-etl\main.py

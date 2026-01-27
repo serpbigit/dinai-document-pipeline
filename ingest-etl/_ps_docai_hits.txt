@@ -1,0 +1,3 @@
+C:\Users\reuve\dinai-document-pipeline\ingest-etl\main.py:221:     # Publish to docai-runner (preserve unicode fields)
+C:\Users\reuve\dinai-document-pipeline\ingest-etl\main.py:28: DOCAI_REQUESTS_TOPIC = os.environ["DOCAI_REQUESTS_TOPIC"]
+C:\Users\reuve\dinai-document-pipeline\ingest-etl\main.py:33: topic_path = publisher.topic_path(PROJECT_ID, DOCAI_REQUESTS_TOPIC)

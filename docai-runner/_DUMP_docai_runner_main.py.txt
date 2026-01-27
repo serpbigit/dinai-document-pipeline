@@ -19,7 +19,7 @@ from google.protobuf.json_format import MessageToDict
 # =============================================================================
 # VERSION (change this string every deploy to confirm you're running the right code)
 # =============================================================================
-VERSION = "2026-01-27T-docai-runner-v4-case-run-prefix+link-index-jsonl"
+VERSION = "2026-01-25T-mainpy-AtoZ-v3-batch-submit+poller+no-retry-storms"
 
 # =============================================================================
 # Environment (required)
@@ -139,7 +139,7 @@ def _extract_job_from_http_request(request: Request) -> Tuple[Optional[Dict[str,
         return job, "", True, msg_id
 
     # Direct job
-    if isinstance(working, dict) and "docId" in working and ("canonicalGcsUri" in working or "sourcePdfUri" in working):
+    if isinstance(working, dict) and "docId" in working and "canonicalGcsUri" in working:
         return working, "", is_pubsub_like, None
 
     return None, "Unrecognized payload format", is_pubsub_like, None
@@ -199,26 +199,9 @@ def _compute_page_scores_from_document_layout(doc_like: dict):
     doc_score = round(sum(r["score"] for r in results) / len(results), 4)
     return results, doc_score
 
-def _parse_gs_uri(gs_uri: str) -> Tuple[str, str]:
-    if not isinstance(gs_uri, str) or not gs_uri.startswith("gs://"):
-        raise ValueError("gs_uri must start with gs://")
-    rest = gs_uri[5:]
-    bucket, _, name = rest.partition("/")
-    if not bucket:
-        raise ValueError("Invalid gs:// URI (missing bucket)")
-    return bucket, name
-
-def _ensure_trailing_slash(s: str) -> str:
-    return s if s.endswith("/") else (s + "/")
-
-def _write_json_gs(gs_prefix_uri: str, obj_name: str, payload: dict):
-    """
-    Writes JSON to gs://bucket/prefix/<obj_name>
-    """
-    bucket, prefix = _parse_gs_uri(gs_prefix_uri)
-    prefix = _ensure_trailing_slash(prefix) if prefix else ""
-    b = storage_client.bucket(bucket)
-    blob = b.blob(f"{prefix}{obj_name}")
+def _write_json_to_gcs(prefix: str, obj_name: str, payload: dict):
+    b = storage_client.bucket(DOCAI_OUT_BUCKET)
+    blob = b.blob(f"{prefix}/{obj_name}")
     blob.upload_from_string(json.dumps(payload, ensure_ascii=False), content_type="application/json")
 
 def _gcs_list(prefix_uri: str) -> List[str]:
@@ -228,38 +211,20 @@ def _gcs_list(prefix_uri: str) -> List[str]:
     """
     if not prefix_uri.startswith("gs://"):
         return []
-    bucket, prefix = _parse_gs_uri(prefix_uri)
+    rest = prefix_uri[5:]
+    bucket, _, prefix = rest.partition("/")
     b = storage_client.bucket(bucket)
     return [f"gs://{bucket}/{blob.name}" for blob in b.list_blobs(prefix=prefix)]
 
 def _gcs_read_json(gcs_uri: str) -> dict:
-    bucket, name = _parse_gs_uri(gcs_uri)
+    if not gcs_uri.startswith("gs://"):
+        raise ValueError("gcs_uri must start with gs://")
+    rest = gcs_uri[5:]
+    bucket, _, name = rest.partition("/")
     b = storage_client.bucket(bucket)
     blob = b.blob(name)
     data = blob.download_as_bytes()
     return json.loads(data.decode("utf-8"))
-
-def _gcs_append_jsonl(gcs_uri: str, record: dict) -> None:
-    """
-    Simple append strategy (OK for early stage / moderate size).
-    If file exists: download + append line + upload.
-    If not: create new with one line.
-    """
-    bucket, name = _parse_gs_uri(gcs_uri)
-    b = storage_client.bucket(bucket)
-    blob = b.blob(name)
-
-    line = json.dumps(record, ensure_ascii=False) + "\n"
-
-    try:
-        if blob.exists():
-            existing = blob.download_as_text(encoding="utf-8")
-            blob.upload_from_string(existing + line, content_type="application/jsonl; charset=utf-8")
-        else:
-            blob.upload_from_string(line, content_type="application/jsonl; charset=utf-8")
-    except Exception as e:
-        # Never fail the whole DocAI finalize because link-index append failed.
-        print(f"WARN link-index append failed uri={gcs_uri} err={e}")
 
 def _mark_failed(doc_id: str, error: str, mode: str, extra: Optional[dict] = None):
     data = {
@@ -279,18 +244,7 @@ def _mark_failed(doc_id: str, error: str, mode: str, extra: Optional[dict] = Non
 
     fs.collection("documents").document(doc_id).set(data, merge=True)
 
-def _mark_batch_running(
-    doc_id: str,
-    op_name: str,
-    batch_output_prefix: str,
-    source_pdf_uri: str,
-    pubsub_message_id: Optional[str],
-    *,
-    case: Optional[str] = None,
-    run_id: Optional[str] = None,
-    docai_run_prefix: Optional[str] = None,
-    latest_link_index_uri: Optional[str] = None,
-):
+def _mark_batch_running(doc_id: str, op_name: str, batch_output_prefix: str, canonical_gcs_uri: str, pubsub_message_id: Optional[str]):
     fs.collection("documents").document(doc_id).set({
         "status": "DOCAI_BATCH_RUNNING",
         "docai": {
@@ -298,17 +252,11 @@ def _mark_batch_running(
             "mode": "batch",
             "batchOperationName": op_name,
             "batchOutputPrefix": batch_output_prefix,
-            "sourcePdfUri": source_pdf_uri,
+            "canonicalGcsUri": canonical_gcs_uri,
             "submittedAtUtc": _utc_ts(),
             "lastPubsubMessageId": pubsub_message_id,
             "lockUntilUtc": None,
             "version": VERSION,
-
-            # New contract fields (optional but preferred)
-            "case": case,
-            "runId": run_id,
-            "docaiRunPrefix": docai_run_prefix,
-            "latestLinkIndexUri": latest_link_index_uri,
         },
         "updatedAt": firestore.SERVER_TIMESTAMP,
     }, merge=True)
@@ -380,28 +328,25 @@ def _claim_lock_or_skip(doc_id: str, pubsub_message_id: Optional[str]) -> Tuple[
     txn = fs.transaction()
     return _txn(txn)
 
-def _docai_online_process_pdf(source_pdf_uri: str) -> dict:
+def _docai_online_process_pdf(canonical_gcs_uri: str) -> dict:
     client = documentai.DocumentProcessorServiceClient()
     req = documentai.ProcessRequest(
         name=DOCAI_PROCESSOR,
-        gcs_document=documentai.GcsDocument(gcs_uri=source_pdf_uri, mime_type="application/pdf"),
+        gcs_document=documentai.GcsDocument(gcs_uri=canonical_gcs_uri, mime_type="application/pdf"),
     )
     result = client.process_document(request=req)
     return MessageToDict(result.document._pb, preserving_proto_field_name=True)
 
-def _submit_batch_for_pdf(source_pdf_uri: str, output_gcs_prefix: str) -> str:
+def _submit_batch_for_pdf(canonical_gcs_uri: str, output_gcs_prefix: str) -> str:
     """
     Submit batch_process_documents and return operation name.
     """
     client = documentai.DocumentProcessorServiceClient()
 
     gcs_documents = documentai.GcsDocuments(
-        documents=[documentai.GcsDocument(gcs_uri=source_pdf_uri, mime_type="application/pdf")]
+        documents=[documentai.GcsDocument(gcs_uri=canonical_gcs_uri, mime_type="application/pdf")]
     )
     input_config = documentai.BatchDocumentsInputConfig(gcs_documents=gcs_documents)
-
-    # DocAI expects a prefix (folder-like) gs://.../something/
-    output_gcs_prefix = _ensure_trailing_slash(output_gcs_prefix)
 
     gcs_output_config = documentai.DocumentOutputConfig.GcsOutputConfig(gcs_uri=output_gcs_prefix)
     output_config = documentai.DocumentOutputConfig(gcs_output_config=gcs_output_config)
@@ -413,6 +358,7 @@ def _submit_batch_for_pdf(source_pdf_uri: str, output_gcs_prefix: str) -> str:
     )
 
     op = client.batch_process_documents(request=req)
+    # Important: return operation name so we can poll later.
     return op.operation.name
 
 def _wait_for_operation(op_name: str, timeout_seconds: int) -> None:
@@ -440,159 +386,82 @@ def _pick_batch_output_json(batch_output_prefix: str) -> Tuple[dict, List[str], 
     if not json_files:
         raise RuntimeError(f"Batch finished but no .json output found under {batch_output_prefix}")
 
+    # Prefer deeper paths that look like the document export; fallback to lexicographically last.
     json_files_sorted = sorted(json_files)
     chosen = json_files_sorted[-1]
     doc_dict = _gcs_read_json(chosen)
     return doc_dict, json_files_sorted, chosen
 
-def _finalize_doc(
-    doc_id: str,
-    source_pdf_uri: str,
-    pubsub_message_id: Optional[str],
-    doc_dict: dict,
-    mode_used: str,
-    *,
-    case: Optional[str] = None,
-    run_id: Optional[str] = None,
-    docai_run_prefix: Optional[str] = None,         # gs://.../<case>/<runId>/
-    latest_link_index_uri: Optional[str] = None,    # gs://.../<case>/latest/link_index.jsonl
-    batch_output_prefix: Optional[str] = None,
-    batch_json_files: Optional[List[str]] = None,
-    batch_chosen_json: Optional[str] = None
-):
+def _finalize_doc(doc_id: str, canonical_gcs_uri: str, pubsub_message_id: Optional[str], doc_dict: dict, mode_used: str,
+                  batch_output_prefix: Optional[str] = None, batch_json_files: Optional[List[str]] = None,
+                  batch_chosen_json: Optional[str] = None):
     ts = _utc_ts()
-
-    # Prefer contract-provided run prefix; fallback to old per-doc run prefix
-    if docai_run_prefix and docai_run_prefix.startswith("gs://"):
-        run_prefix_uri = _ensure_trailing_slash(docai_run_prefix)
-    else:
-        run_prefix_uri = f"gs://{DOCAI_OUT_BUCKET}/{doc_id}/{ts}/"
-
-    # Keep a per-doc latest manifest too (handy for debugging / back-compat)
-    latest_prefix_uri = f"gs://{DOCAI_OUT_BUCKET}/{doc_id}/latest/"
+    run_prefix = f"{doc_id}/{ts}"
+    latest_prefix = f"{doc_id}/latest"
 
     pages, doc_score = _compute_page_scores_from_document_layout(doc_dict)
 
-    # Write doc + manifest into the RUN prefix (case/runId if provided)
-    _write_json_gs(run_prefix_uri, "docai_document.json", doc_dict)
+    _write_json_to_gcs(run_prefix, "docai_document.json", doc_dict)
 
     manifest = {
         "docId": doc_id,
-        "case": case,
-        "runId": run_id,
-        "sourcePdfUri": source_pdf_uri,
+        "canonicalGcsUri": canonical_gcs_uri,
         "processor": DOCAI_PROCESSOR,
         "createdAtUtc": ts,
         "docQualityScore": doc_score,
         "pubsubMessageId": pubsub_message_id,
         "version": VERSION,
         "mode": mode_used,
-        "docaiRunPrefix": run_prefix_uri,
     }
     if mode_used == "batch":
         manifest["batchOutputPrefix"] = batch_output_prefix
         manifest["batchJsonFiles"] = batch_json_files or []
         manifest["batchChosenJson"] = batch_chosen_json
 
-    _write_json_gs(run_prefix_uri, "manifest.json", manifest)
+    _write_json_to_gcs(run_prefix, "manifest.json", manifest)
 
-    # Update per-doc latest manifest (legacy but useful)
-    _write_json_gs(latest_prefix_uri, "manifest.json", {
+    _write_json_to_gcs(latest_prefix, "manifest.json", {
         "docId": doc_id,
-        "latestRunPrefix": run_prefix_uri,
+        "latestRunPrefix": f"gs://{DOCAI_OUT_BUCKET}/{run_prefix}/",
         "docQualityScore": doc_score,
         "updatedAtUtc": ts,
         "version": VERSION,
         "mode": mode_used,
-        "case": case,
-        "runId": run_id,
     })
 
-    # Compute stable URIs we want to publish/store
-    docai_document_json_uri = _ensure_trailing_slash(run_prefix_uri) + "docai_document.json"
-    run_manifest_uri = _ensure_trailing_slash(run_prefix_uri) + "manifest.json"
-
-    # Append durable mapping record (case-scoped)
-    if latest_link_index_uri:
-        link_rec = {
-            "atUtc": ts,
-            "docId": doc_id,
-            "case": case,
-            "runId": run_id,
-            "sourcePdfUri": source_pdf_uri,
-            "docaiRunPrefix": run_prefix_uri,
-            "docaiDocumentJsonUri": docai_document_json_uri,
-            "runManifestUri": run_manifest_uri,
-            "batchOutputPrefix": batch_output_prefix,
-            "batchChosenJson": batch_chosen_json,
-            "processor": DOCAI_PROCESSOR,
-            "mode": mode_used,
-            "status": "DOCAI_DONE",
-            "version": VERSION,
-        }
-        _gcs_append_jsonl(latest_link_index_uri, link_rec)
-
-    # Firestore write (new contract fields included)
     fs.collection("documents").document(doc_id).set({
         "status": "DOCAI_DONE",
         "docai": {
-            "processor": DOCAI_PROCESSOR,
-            "mode": mode_used,
-            "finishedAtUtc": ts,
-            "lockUntilUtc": None,
-            "version": VERSION,
-
+            "outputPrefix": f"gs://{DOCAI_OUT_BUCKET}/{run_prefix}/",
+            "latestPrefix": f"gs://{DOCAI_OUT_BUCKET}/{latest_prefix}/",
             "docQualityScore": doc_score,
             "pages": pages,
-
-            # New linkage contract
-            "case": case,
-            "runId": run_id,
-            "sourcePdfUri": source_pdf_uri,
-            "docaiRunPrefix": run_prefix_uri,
-            "docaiDocumentJsonUri": docai_document_json_uri,
-            "runManifestUri": run_manifest_uri,
-            "latestLinkIndexUri": latest_link_index_uri,
-
-            # Batch debug
+            "processor": DOCAI_PROCESSOR,
+            "finishedAtUtc": _utc_ts(),
+            "lockUntilUtc": None,
+            "version": VERSION,
+            "mode": mode_used,
             "batchOutputPrefix": batch_output_prefix,
-            "batchChosenJson": batch_chosen_json,
         },
         "updatedAt": firestore.SERVER_TIMESTAMP,
     }, merge=True)
 
-    # Publish results message
     out_msg = {
         "docId": doc_id,
-        "case": case,
-        "runId": run_id,
-        "sourcePdfUri": source_pdf_uri,
-        "docaiRunPrefix": run_prefix_uri,
-        "docaiDocumentJsonUri": docai_document_json_uri,
-        "runManifestUri": run_manifest_uri,
-        "latestLinkIndexUri": latest_link_index_uri,
+        "docaiOutputPrefix": f"gs://{DOCAI_OUT_BUCKET}/{run_prefix}/",
+        "docaiLatestPrefix": f"gs://{DOCAI_OUT_BUCKET}/{latest_prefix}/",
         "docQualityScore": doc_score,
-        "processor": DOCAI_PROCESSOR,
+        "canonicalGcsUri": canonical_gcs_uri,
         "version": VERSION,
         "mode": mode_used,
     }
-    publisher.publish(topic_path, json.dumps(out_msg, ensure_ascii=False).encode("utf-8"))
+    publisher.publish(topic_path, json.dumps(out_msg).encode("utf-8"))
 
-    print(f"OK docId={doc_id} case={case} runId={run_id} docScore={doc_score} mode={mode_used} run={run_prefix_uri}")
+    print(f"OK docId={doc_id} docScore={doc_score} pages={len(pages)} mode={mode_used} run=gs://{DOCAI_OUT_BUCKET}/{run_prefix}/")
 
 def _process_job(job: Dict[str, Any], pubsub_message_id: Optional[str]) -> Tuple[str, int]:
     doc_id = job["docId"]
-
-    # New contract fields (optional but preferred)
-    case = job.get("case")
-    run_id = job.get("runId")
-    latest_link_index_uri = job.get("latestLinkIndexUri")
-
-    # - sourcePdfUri must remain the PDF we will open in the viewer / cite (canonical).
-    source_pdf_uri = job.get("sourcePdfUri") or job.get("canonicalGcsUri")
-
-    # docaiRunPrefix should be gs://.../<case>/<runId>/
-    docai_run_prefix = job.get("docaiRunPrefix")
+    canonical_gcs_uri = job["canonicalGcsUri"]
 
     proceed, reason = _claim_lock_or_skip(doc_id, pubsub_message_id)
     if not proceed:
@@ -602,34 +471,19 @@ def _process_job(job: Dict[str, Any], pubsub_message_id: Optional[str]) -> Tuple
     try:
         # ONLINE attempt first
         try:
-            doc_dict = _docai_online_process_pdf(source_pdf_uri)
-            _finalize_doc(
-                doc_id, source_pdf_uri, pubsub_message_id,
-                doc_dict, mode_used="online",
-                case=case, run_id=run_id,
-                docai_run_prefix=docai_run_prefix,
-                latest_link_index_uri=latest_link_index_uri
-            )
+            doc_dict = _docai_online_process_pdf(canonical_gcs_uri)
+            _finalize_doc(doc_id, canonical_gcs_uri, pubsub_message_id, doc_dict, mode_used="online")
             return ("ok", 200)
 
         except Exception as e:
             # Online page-limit => submit batch
             if _is_page_limit_exceeded(e):
-                # Prefer contract-provided output prefix:
-                # output prefix for DocAI batch must end with "/"
-                if isinstance(docai_run_prefix, str) and docai_run_prefix.startswith("gs://"):
-                    batch_output_prefix = _ensure_trailing_slash(docai_run_prefix) + "batch_output/"
-                else:
-                    # fallback (legacy)
-                    batch_output_prefix = f"gs://{DOCAI_OUT_BUCKET}/{doc_id}/{_utc_ts()}/batch_output/"
-
+                # DocAI requires output prefix ending with "/"
+                batch_output_prefix = f"gs://{DOCAI_OUT_BUCKET}/{doc_id}/{_utc_ts()}/batch_output/"
                 print(f"PAGE_LIMIT_EXCEEDED -> submit batch docId={doc_id} out={batch_output_prefix}")
 
-                op_name = _submit_batch_for_pdf(source_pdf_uri, batch_output_prefix)
-                _mark_batch_running(
-                    doc_id, op_name, batch_output_prefix, source_pdf_uri, pubsub_message_id,
-                    case=case, run_id=run_id, docai_run_prefix=docai_run_prefix, latest_link_index_uri=latest_link_index_uri
-                )
+                op_name = _submit_batch_for_pdf(canonical_gcs_uri, batch_output_prefix)
+                _mark_batch_running(doc_id, op_name, batch_output_prefix, canonical_gcs_uri, pubsub_message_id)
 
                 # If configured, wait here (not recommended). Otherwise ACK now and let poller finalize.
                 if BATCH_WAIT:
@@ -637,11 +491,8 @@ def _process_job(job: Dict[str, Any], pubsub_message_id: Optional[str]) -> Tuple
                     _wait_for_operation(op_name, BATCH_WAIT_SECONDS)
                     doc_dict, batch_json_files, chosen = _pick_batch_output_json(batch_output_prefix)
                     _finalize_doc(
-                        doc_id, source_pdf_uri, pubsub_message_id,
+                        doc_id, canonical_gcs_uri, pubsub_message_id,
                         doc_dict, mode_used="batch",
-                        case=case, run_id=run_id,
-                        docai_run_prefix=docai_run_prefix,
-                        latest_link_index_uri=latest_link_index_uri,
                         batch_output_prefix=batch_output_prefix,
                         batch_json_files=batch_json_files,
                         batch_chosen_json=chosen
@@ -653,7 +504,7 @@ def _process_job(job: Dict[str, Any], pubsub_message_id: Optional[str]) -> Tuple
 
             # Permanent InvalidArgument -> mark failed + ACK so Pub/Sub stops retry storms
             if _is_permanent_invalid_argument(e):
-                _mark_failed(doc_id, f"invalid_argument: {e}", mode="online", extra={"sourcePdfUri": source_pdf_uri})
+                _mark_failed(doc_id, f"invalid_argument: {e}", mode="online", extra={"canonicalGcsUri": canonical_gcs_uri})
                 print(f"PERMANENT InvalidArgument -> ACK docId={doc_id} err={e}")
                 return ("ok", 200)
 
@@ -684,18 +535,11 @@ def _poll_finalize(limit: int) -> Dict[str, Any]:
         doc_id = snap.id
         data = snap.to_dict() or {}
         docai = data.get("docai") or {}
-
         op_name = docai.get("batchOperationName")
         batch_output_prefix = docai.get("batchOutputPrefix")
-        source_pdf_uri = docai.get("sourcePdfUri") or docai.get("canonicalGcsUri")
+        canonical_gcs_uri = docai.get("canonicalGcsUri") or docai.get("canonicalGcsUri".lower())
 
-        # New fields persisted during batch submit
-        case = docai.get("case")
-        run_id = docai.get("runId")
-        docai_run_prefix = docai.get("docaiRunPrefix")
-        latest_link_index_uri = docai.get("latestLinkIndexUri")
-
-        if not op_name or not batch_output_prefix or not source_pdf_uri:
+        if not op_name or not batch_output_prefix or not canonical_gcs_uri:
             failed += 1
             _mark_failed(doc_id, "batch_poll_missing_fields", mode="batch", extra={"docai": docai})
             details.append({"docId": doc_id, "status": "failed_missing_fields"})
@@ -717,11 +561,8 @@ def _poll_finalize(limit: int) -> Dict[str, Any]:
             # Done: read output JSON and finalize
             doc_dict, batch_json_files, chosen = _pick_batch_output_json(batch_output_prefix)
             _finalize_doc(
-                doc_id, source_pdf_uri, pubsub_message_id=None,
+                doc_id, canonical_gcs_uri, pubsub_message_id=None,
                 doc_dict=doc_dict, mode_used="batch",
-                case=case, run_id=run_id,
-                docai_run_prefix=docai_run_prefix,
-                latest_link_index_uri=latest_link_index_uri,
                 batch_output_prefix=batch_output_prefix,
                 batch_json_files=batch_json_files,
                 batch_chosen_json=chosen
@@ -730,6 +571,7 @@ def _poll_finalize(limit: int) -> Dict[str, Any]:
             details.append({"docId": doc_id, "status": "finalized", "chosen": chosen})
 
         except Exception as e:
+            # If the operation failed permanently, mark failed and move on (ACK behavior)
             failed += 1
             _mark_failed(doc_id, f"batch_poll_error: {e}", mode="batch", extra={"operationName": op_name, "batchOutputPrefix": batch_output_prefix})
             details.append({"docId": doc_id, "status": "failed", "err": str(e)})
@@ -746,7 +588,7 @@ def _poll_finalize(limit: int) -> Dict[str, Any]:
 @functions_framework.http
 def docai_runner(request: Request):
     try:
-        # Poll endpoint (use this to finalize batch jobs)
+        # Poll endpoint (use this to finalize batch jobs overnight)
         if request.method == "GET" and request.args.get("poll") == "1":
             limit = int(request.args.get("limit") or DEFAULT_POLL_LIMIT)
             report = _poll_finalize(limit)
@@ -765,12 +607,12 @@ def docai_runner(request: Request):
             print(msg)
             return (msg, 200) if is_pubsub_like else (msg, 400)
 
-        if "docId" not in job or ("canonicalGcsUri" not in job and "sourcePdfUri" not in job):
-            msg = "BAD REQUEST: missing docId/(canonicalGcsUri|sourcePdfUri)"
+        if "docId" not in job or "canonicalGcsUri" not in job:
+            msg = "BAD REQUEST: missing docId/canonicalGcsUri"
             print(msg)
             return (msg, 200) if is_pubsub_like else (msg, 400)
 
-        print(f"Received job docId={job.get('docId')} sourcePdfUri={job.get('sourcePdfUri')} canonical={job.get('canonicalGcsUri')} msgId={pubsub_message_id}")
+        print(f"Received job docId={job.get('docId')} canonical={job.get('canonicalGcsUri')} msgId={pubsub_message_id}")
         return _process_job(job, pubsub_message_id)
 
     except Exception as e:
@@ -782,8 +624,8 @@ def docai_runner(request: Request):
             body, _ = _parse_json_body(request)
             body = body or {}
             work = _unwrap_cloudevent_if_needed(body) if isinstance(body, dict) else {}
-
             doc_id = work.get("docId")
+
             if not doc_id and isinstance(work.get("message"), dict):
                 j, _ = _decode_pubsub_data_to_job(work["message"])
                 if isinstance(j, dict):
@@ -796,3 +638,4 @@ def docai_runner(request: Request):
             pass
 
         return ("internal error", 500)
+
