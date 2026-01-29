@@ -247,6 +247,7 @@ def _docai_online_process_pdf(source_pdf_uri: str) -> dict:
 
     result = client.process_document(request=req)
     return MessageToDict(result.document._pb, preserving_proto_field_name=True)
+
 def _submit_batch_for_pdf(source_pdf_uri: str, output_gcs_prefix: str) -> str:
     client = documentai.DocumentProcessorServiceClient()
     gcs_documents = documentai.GcsDocuments(
@@ -515,4 +516,5 @@ def docai_runner(request: Request):
     except Exception as e:
         traceback.print_exc()
         return (json.dumps({"ok": False, "error": str(e)}), 500, {"Content-Type": "application/json"})
+
 
