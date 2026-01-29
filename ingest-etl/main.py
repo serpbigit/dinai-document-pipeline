@@ -15,7 +15,7 @@ from google.cloud import storage
 # =============================================================================
 # VERSION
 # =============================================================================
-VERSION = "2026-01-27T-ingest-AtoZ-v3-case-rooted-docai-prefix+link-index-contract"
+VERSION = "2026-01-27T-ingest-AtoZ-v4-docai-raw+geometry+quality-contract"
 
 # =========================
 # Environment
@@ -207,9 +207,17 @@ def ingest_etl(request):
     canonical_gcs_uri = f"gs://{CANONICAL_BUCKET}/{canonical_path}"
     raw_gcs_uri = f"gs://{RAW_BUCKET}/{raw_path}"
 
-    # Prepare a run id for downstream batch grouping.
-    # Runner may override / group multiple docs into a single run; still we provide a deterministic default.
+    # Provide a run id for downstream grouping
     run_id = _utc_run_id()
+
+    # Contract for runner: explicitly request RAW docai output + geometry + quality score preservation
+    docai_expectations = {
+        "persistRawDocaiDocument": True,   # store full DocAI Document JSON (geometry, anchors, etc.)
+        "persistPageGeometry": True,       # bounding polys, text anchors, etc.
+        "persistQualityScores": True,      # image quality scores -> docQualityScore
+        "persistExtractedText": True,      # full doc text where available
+        "persistDerivedLayoutBlocks": True # your simplified block list is fine, but NOT instead of RAW
+    }
 
     # Persist metadata for provenance + monitoring
     doc_ref.set(
@@ -241,6 +249,7 @@ def ingest_etl(request):
                 "casePrefix": _docai_case_prefix(case),
                 "runPrefix": _docai_run_prefix(case, run_id),
                 "latestLinkIndexUri": _docai_latest_link_index_uri(case),
+                "expectations": docai_expectations,
             },
             "status": "CANONICALIZED",
             "createdAt": firestore.SERVER_TIMESTAMP,
@@ -249,10 +258,6 @@ def ingest_etl(request):
     )
 
     # Publish to docai-runner (preserve unicode fields)
-    # IMPORTANT CONTRACT:
-    # - sourcePdfUri must remain the PDF we will open in the viewer / cite (canonical).
-    # - docaiOut* tells runner where to place outputs so provenance is case-rooted.
-    # - latestLinkIndexUri tells runner where to append/update durable mapping JSONL.
     msg = {
         "docId": doc_id,
         "case": case,
@@ -281,9 +286,12 @@ def ingest_etl(request):
 
         # Output routing for DocAI (runner uses these to set gcs_output_uri_prefix)
         "docaiOutBucket": DOCAI_OUT_BUCKET,
-        "docaiCasePrefix": _docai_case_prefix(case),     # gs://.../<case>/
+        "docaiCasePrefix": _docai_case_prefix(case),        # gs://.../<case>/
         "docaiRunPrefix": _docai_run_prefix(case, run_id),  # gs://.../<case>/<runId>/
         "latestLinkIndexUri": _docai_latest_link_index_uri(case),
+
+        # What we expect runner to persist
+        "docaiExpectations": docai_expectations,
 
         # Versioning
         "ingestVersion": VERSION,

@@ -12,151 +12,156 @@ from google.api_core import exceptions as gexceptions
 from google.api_core import operation as ga_operation
 from google.cloud import documentai_v1 as documentai
 from google.cloud import firestore
-from google.cloud import storage
 from google.cloud import pubsub_v1
+from google.cloud import storage
 from google.protobuf.json_format import MessageToDict
 
 # =============================================================================
-# VERSION (change this string every deploy to confirm you're running the right code)
+# Version
 # =============================================================================
-VERSION = "2026-01-27T-docai-runner-v4-case-run-prefix+link-index-jsonl"
+VERSION = "2026-01-27-form-geometry"
 
 # =============================================================================
 # Environment (required)
 # =============================================================================
 PROJECT_ID = os.environ["PROJECT_ID"]
-DOCAI_PROCESSOR = os.environ["DOCAI_PROCESSOR"]          # full resource name
+DOCAI_PROCESSOR = os.environ.get("DOCAI_PROCESSOR", "").strip()  # full resource name (can be empty)
+DOCAI_PROCESSOR_FALLBACK_FORM = os.environ.get("DOCAI_PROCESSOR_FALLBACK_FORM", "").strip()
+# If DOCAI_PROCESSOR is not set (or set to AUTO), we fall back to DOCAI_PROCESSOR_FALLBACK_FORM (recommended: FORM Parser).
+if (not DOCAI_PROCESSOR) or (DOCAI_PROCESSOR.upper() == "AUTO"):
+    if not DOCAI_PROCESSOR_FALLBACK_FORM:
+        raise RuntimeError("DOCAI_PROCESSOR is not set. Set DOCAI_PROCESSOR to a full processor resource name, or set DOCAI_PROCESSOR_FALLBACK_FORM for AUTO mode.")
+    DOCAI_PROCESSOR = DOCAI_PROCESSOR_FALLBACK_FORM
 DOCAI_RESULTS_TOPIC = os.environ["DOCAI_RESULTS_TOPIC"]  # topic name (not full path)
 DOCAI_OUT_BUCKET = os.environ["DOCAI_OUT_BUCKET"]        # bucket name, without gs://
 
 # Lock settings (prevents concurrent duplicates + handles Pub/Sub at-least-once)
 LOCK_MINUTES = int(os.environ.get("DOCAI_LOCK_MINUTES", "15"))
 
-# Batch behavior:
-# - For large PDFs (online page limit), we SUBMIT batch and ACK immediately by default.
-# - If you really want to wait in-request (not recommended), set DOCAI_BATCH_WAIT=1
-BATCH_WAIT = os.environ.get("DOCAI_BATCH_WAIT", "0").strip() == "1"
-BATCH_WAIT_SECONDS = int(os.environ.get("DOCAI_BATCH_WAIT_SECONDS", "3300"))  # 55 minutes default
-
-# Polling:
-# When poll=1 is called, we attempt to finalize up to N batch-running docs.
-DEFAULT_POLL_LIMIT = int(os.environ.get("DOCAI_POLL_LIMIT", "25"))
+# Optional per-tenant storage layout
+DEFAULT_CASE = os.environ.get("DEFAULT_CASE", "").strip()
 
 # =============================================================================
-# Clients (module-level reuse)
+# Clients
 # =============================================================================
-storage_client = storage.Client()
-fs = firestore.Client(project=PROJECT_ID)
-publisher = pubsub_v1.PublisherClient()
-topic_path = publisher.topic_path(PROJECT_ID, DOCAI_RESULTS_TOPIC)
+_fs = firestore.Client(project=PROJECT_ID)
+_storage = storage.Client(project=PROJECT_ID)
+_publisher = pubsub_v1.PublisherClient()
+_results_topic_path = _publisher.topic_path(PROJECT_ID, DOCAI_RESULTS_TOPIC)
 
 # =============================================================================
 # Helpers
 # =============================================================================
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+def _ensure_trailing_slash(uri: str) -> str:
+    return uri if uri.endswith("/") else (uri + "/")
 
-def _utc_ts() -> str:
-    return _utc_now().strftime("%Y%m%dT%H%M%SZ")
+def _gcs_bucket():
+    return _storage.bucket(DOCAI_OUT_BUCKET)
 
-def _is_pubsub_like_request(request: Request, body: Optional[dict]) -> bool:
-    # CloudEvents headers (often present on Pub/Sub push)
-    if request.headers.get("ce-type") or request.headers.get("ce-id") or request.headers.get("ce-source"):
+def _gcs_list(prefix_uri: str) -> List[str]:
+    bkt, prefix = _parse_gs_uri(prefix_uri)
+    bucket = _storage.bucket(bkt)
+    out = []
+    for blob in bucket.list_blobs(prefix=prefix):
+        out.append(f"gs://{bkt}/{blob.name}")
+    return out
+
+def _gcs_read_json(gs_uri: str) -> dict:
+    bkt, name = _parse_gs_uri(gs_uri)
+    blob = _storage.bucket(bkt).blob(name)
+    data = blob.download_as_bytes()
+    return json.loads(data.decode("utf-8"))
+
+def _write_json_gs(prefix_gs_uri: str, name: str, obj: Any):
+    prefix_gs_uri = _ensure_trailing_slash(prefix_gs_uri)
+    bkt, prefix = _parse_gs_uri(prefix_gs_uri)
+    blob = _storage.bucket(bkt).blob(prefix + name)
+    blob.upload_from_string(
+        json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8"),
+        content_type="application/json; charset=utf-8",
+    )
+
+def _publish_results(payload: dict):
+    _publisher.publish(
+        _results_topic_path,
+        json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+    )
+
+def _acquire_lock(doc_id: str, pubsub_message_id: Optional[str]) -> bool:
+    """
+    Firestore lock doc:
+      docaiLocks/{docId}
+    """
+    lock_ref = _fs.collection("docaiLocks").document(doc_id)
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(minutes=LOCK_MINUTES)
+
+    def txn_fn(txn):
+        snap = lock_ref.get(transaction=txn)
+        if snap.exists:
+            d = snap.to_dict() or {}
+            exp = d.get("expiresAtUtc")
+            if exp:
+                try:
+                    exp_dt = exp
+                    if isinstance(exp, str):
+                        exp_dt = datetime.fromisoformat(exp.replace("Z", "+00:00"))
+                    if exp_dt > now:
+                        return False
+                except Exception:
+                    pass
+        txn.set(lock_ref, {
+            "docId": doc_id,
+            "lockedAtUtc": now.isoformat(),
+            "expiresAtUtc": expires.isoformat(),
+            "pubsubMessageId": pubsub_message_id,
+            "version": VERSION,
+        })
         return True
 
-    # Pub/Sub push envelope patterns
-    if isinstance(body, dict):
-        if isinstance(body.get("message"), dict):
-            return True
-        data = body.get("data")
-        if isinstance(data, dict) and isinstance(data.get("message"), dict):
-            return True
+    txn = _fs.transaction()
+    return txn_fn(txn)
 
-    return False
-
-def _parse_json_body(request: Request) -> Tuple[Optional[Dict[str, Any]], str]:
-    body = request.get_json(silent=True)
-    if isinstance(body, dict):
-        return body, ""
-
-    raw = request.get_data() or b""
-    if not raw:
-        return None, "Empty request body"
-
+def _release_lock(doc_id: str):
     try:
-        parsed = json.loads(raw.decode("utf-8"))
-        if isinstance(parsed, dict):
-            return parsed, ""
-        return None, "JSON body is not an object"
+        _fs.collection("docaiLocks").document(doc_id).delete()
     except Exception:
-        return None, "Request body is not valid JSON"
-
-def _unwrap_cloudevent_if_needed(body: Dict[str, Any]) -> Dict[str, Any]:
-    data = body.get("data")
-    if isinstance(data, dict):
-        return data
-    return body
-
-def _decode_pubsub_data_to_job(message: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str]:
-    b64 = message.get("data")
-    if not b64:
-        return None, "Pub/Sub envelope missing message.data"
-
-    try:
-        decoded_bytes = base64.b64decode(b64)
-    except Exception as e:
-        return None, f"Failed base64 decode: {e}"
-
-    try:
-        decoded_text = decoded_bytes.decode("utf-8")
-    except Exception as e:
-        return None, f"Decoded bytes are not UTF-8: {e}"
-
-    try:
-        job = json.loads(decoded_text)
-        if not isinstance(job, dict):
-            return None, "Decoded Pub/Sub message is not a JSON object"
-        return job, ""
-    except Exception as e:
-        return None, f"Failed to parse decoded JSON: {e}"
-
-def _extract_job_from_http_request(request: Request) -> Tuple[Optional[Dict[str, Any]], str, bool, Optional[str]]:
-    body, err = _parse_json_body(request)
-    if err:
-        return None, err, _is_pubsub_like_request(request, None), None
-
-    working = _unwrap_cloudevent_if_needed(body)
-    is_pubsub_like = _is_pubsub_like_request(request, body) or _is_pubsub_like_request(request, working)
-
-    # Pub/Sub envelope
-    if isinstance(working, dict) and isinstance(working.get("message"), dict):
-        msg = working["message"]
-        msg_id = msg.get("messageId") or msg.get("message_id")
-        job, derr = _decode_pubsub_data_to_job(msg)
-        if derr:
-            return None, derr, True, msg_id
-        return job, "", True, msg_id
-
-    # Direct job
-    if isinstance(working, dict) and "docId" in working and ("canonicalGcsUri" in working or "sourcePdfUri" in working):
-        return working, "", is_pubsub_like, None
-
-    return None, "Unrecognized payload format", is_pubsub_like, None
+        pass
 
 def _compute_page_scores_from_document_layout(doc_like: dict):
     """
-    Lightweight heuristic "quality-ish" scoring using Document Layout blocks.
-    This is NOT DocAI confidence; it's a signal: more extracted text + more blocks => higher score.
+    Lightweight heuristic "quality-ish" scoring.
 
-    Supports both:
-      - documentLayout / textBlock / pageSpan
-      - document_layout / text_block / page_span
+    IMPORTANT:
+      - This is NOT DocAI confidence.
+      - It's a signal for routing / filtering / prioritization.
+
+    It prefers DocumentLayout blocks when available (some batch outputs),
+    and falls back to per-page structure counts for full Document outputs
+    (e.g., FORM parser with geometry).
+
+    Supports:
+      - {"documentLayout": {...}} layout-only payloads
+      - Full Document payloads with {"pages": [...]} (Python client)
+      - REST payloads with {"document": {...}}
     """
-    layout = doc_like.get("documentLayout") or doc_like.get("document_layout") or {}
-    blocks = layout.get("blocks") or []
+    if not isinstance(doc_like, dict):
+        return [], 0.0
 
-    pages = {}
+    # Unwrap REST / batch wrapper if present
+    if "document" in doc_like and isinstance(doc_like.get("document"), dict):
+        doc = doc_like["document"]
+    else:
+        doc = doc_like
+
+    # 1) Preferred: layout blocks
+    layout = doc.get("documentLayout") or doc.get("document_layout") or {}
+    blocks = layout.get("blocks") or []
+    pages_acc = {}
+
     for b in blocks:
         if not isinstance(b, dict):
             continue
@@ -168,28 +173,52 @@ def _compute_page_scores_from_document_layout(doc_like: dict):
 
         tb = b.get("textBlock") or b.get("text_block") or {}
         txt = tb.get("text") or ""
-        pages.setdefault(p, {"page": p, "textLen": 0, "numBlocks": 0})
-        pages[p]["textLen"] += len(txt)
-        pages[p]["numBlocks"] += 1
+        pages_acc.setdefault(p, {"page": p, "textLen": 0, "units": 0})
+        pages_acc[p]["textLen"] += len(txt)
+        pages_acc[p]["units"] += 1
+
+    # 2) Fallback: full Document pages (FORM/OCR/etc.)
+    if not pages_acc:
+        pages = doc.get("pages") if isinstance(doc, dict) else None
+        if isinstance(pages, list):
+            for i, p in enumerate(pages, start=1):
+                if not isinstance(p, dict):
+                    continue
+
+                # Count structural units that correlate with extraction richness
+                n_par = len(p.get("paragraphs") or [])
+                n_blk = len(p.get("blocks") or [])
+                n_lin = len(p.get("lines") or [])
+                n_tok = len(p.get("tokens") or [])
+
+                units = n_par + n_blk + n_lin + n_tok
+                # Estimate text length by counting anchors (cheap) if text exists
+                # (we avoid heavy reconstruction here)
+                bp = json.dumps(p, ensure_ascii=False)
+                approx_text = bp.count('"textAnchor"') * 15
+
+                pages_acc[i] = {"page": i, "textLen": approx_text, "units": units}
 
     results = []
-    for p in sorted(pages.keys()):
-        tl = pages[p]["textLen"]
-        nb = pages[p]["numBlocks"]
+    for p in sorted(pages_acc.keys()):
+        tl = pages_acc[p]["textLen"]
+        units = pages_acc[p]["units"]
 
         s_len = min(1.0, tl / 3000.0)
-        s_blk = min(1.0, nb / 10.0)
-        score = round(s_len * s_blk, 4)
+        s_units = min(1.0, units / 40.0)
+        score = round(s_len * s_units, 4)
 
         flags = []
         if tl < 50:
             flags.append("empty_or_near_empty")
+        if units < 3:
+            flags.append("low_structure")
 
         results.append({
             "page": p,
             "score": score,
             "textLen": tl,
-            "numBlocks": nb,
+            "numUnits": units,
             "flags": flags,
         })
 
@@ -199,195 +228,49 @@ def _compute_page_scores_from_document_layout(doc_like: dict):
     doc_score = round(sum(r["score"] for r in results) / len(results), 4)
     return results, doc_score
 
+
 def _parse_gs_uri(gs_uri: str) -> Tuple[str, str]:
     if not isinstance(gs_uri, str) or not gs_uri.startswith("gs://"):
         raise ValueError("gs_uri must start with gs://")
     rest = gs_uri[5:]
     bucket, _, name = rest.partition("/")
-    if not bucket:
-        raise ValueError("Invalid gs:// URI (missing bucket)")
+    if not bucket or not name:
+        raise ValueError("invalid gs:// uri")
     return bucket, name
 
-def _ensure_trailing_slash(s: str) -> str:
-    return s if s.endswith("/") else (s + "/")
-
-def _write_json_gs(gs_prefix_uri: str, obj_name: str, payload: dict):
-    """
-    Writes JSON to gs://bucket/prefix/<obj_name>
-    """
-    bucket, prefix = _parse_gs_uri(gs_prefix_uri)
-    prefix = _ensure_trailing_slash(prefix) if prefix else ""
-    b = storage_client.bucket(bucket)
-    blob = b.blob(f"{prefix}{obj_name}")
-    blob.upload_from_string(json.dumps(payload, ensure_ascii=False), content_type="application/json")
-
-def _gcs_list(prefix_uri: str) -> List[str]:
-    """
-    prefix_uri: gs://bucket/prefix/...
-    returns list of full gs:// URIs
-    """
-    if not prefix_uri.startswith("gs://"):
-        return []
-    bucket, prefix = _parse_gs_uri(prefix_uri)
-    b = storage_client.bucket(bucket)
-    return [f"gs://{bucket}/{blob.name}" for blob in b.list_blobs(prefix=prefix)]
-
-def _gcs_read_json(gcs_uri: str) -> dict:
-    bucket, name = _parse_gs_uri(gcs_uri)
-    b = storage_client.bucket(bucket)
-    blob = b.blob(name)
-    data = blob.download_as_bytes()
-    return json.loads(data.decode("utf-8"))
-
-def _gcs_append_jsonl(gcs_uri: str, record: dict) -> None:
-    """
-    Simple append strategy (OK for early stage / moderate size).
-    If file exists: download + append line + upload.
-    If not: create new with one line.
-    """
-    bucket, name = _parse_gs_uri(gcs_uri)
-    b = storage_client.bucket(bucket)
-    blob = b.blob(name)
-
-    line = json.dumps(record, ensure_ascii=False) + "\n"
-
-    try:
-        if blob.exists():
-            existing = blob.download_as_text(encoding="utf-8")
-            blob.upload_from_string(existing + line, content_type="application/jsonl; charset=utf-8")
-        else:
-            blob.upload_from_string(line, content_type="application/jsonl; charset=utf-8")
-    except Exception as e:
-        # Never fail the whole DocAI finalize because link-index append failed.
-        print(f"WARN link-index append failed uri={gcs_uri} err={e}")
-
-def _mark_failed(doc_id: str, error: str, mode: str, extra: Optional[dict] = None):
-    data = {
-        "status": "DOCAI_FAILED",
-        "docai": {
-            "error": error,
-            "mode": mode,
-            "finishedAtUtc": _utc_ts(),
-            "processor": DOCAI_PROCESSOR,
-            "lockUntilUtc": None,
-            "version": VERSION,
-        },
-        "updatedAt": firestore.SERVER_TIMESTAMP,
-    }
-    if extra and isinstance(extra, dict):
-        data["docai"].update(extra)
-
-    fs.collection("documents").document(doc_id).set(data, merge=True)
-
-def _mark_batch_running(
-    doc_id: str,
-    op_name: str,
-    batch_output_prefix: str,
-    source_pdf_uri: str,
-    pubsub_message_id: Optional[str],
-    *,
-    case: Optional[str] = None,
-    run_id: Optional[str] = None,
-    docai_run_prefix: Optional[str] = None,
-    latest_link_index_uri: Optional[str] = None,
-):
-    fs.collection("documents").document(doc_id).set({
-        "status": "DOCAI_BATCH_RUNNING",
-        "docai": {
-            "processor": DOCAI_PROCESSOR,
-            "mode": "batch",
-            "batchOperationName": op_name,
-            "batchOutputPrefix": batch_output_prefix,
-            "sourcePdfUri": source_pdf_uri,
-            "submittedAtUtc": _utc_ts(),
-            "lastPubsubMessageId": pubsub_message_id,
-            "lockUntilUtc": None,
-            "version": VERSION,
-
-            # New contract fields (optional but preferred)
-            "case": case,
-            "runId": run_id,
-            "docaiRunPrefix": docai_run_prefix,
-            "latestLinkIndexUri": latest_link_index_uri,
-        },
-        "updatedAt": firestore.SERVER_TIMESTAMP,
-    }, merge=True)
-
-def _is_page_limit_exceeded(err: Exception) -> bool:
-    msg = str(err) or ""
-    return ("PAGE_LIMIT_EXCEEDED" in msg) or ("pages exceed the limit" in msg.lower())
-
-def _is_permanent_invalid_argument(err: Exception) -> bool:
-    return isinstance(err, gexceptions.InvalidArgument)
-
-def _claim_lock_or_skip(doc_id: str, pubsub_message_id: Optional[str]) -> Tuple[bool, str]:
-    """
-    Firestore transaction:
-      - If status DOCAI_DONE -> skip
-      - If same pubsub_message_id already processed -> skip
-      - If lockUntilUtc in future and status DOCAI_RUNNING -> skip
-      - Else set DOCAI_RUNNING and lockUntilUtc and proceed
-    """
-    doc_ref = fs.collection("documents").document(doc_id)
-
-    @firestore.transactional
-    def _txn(txn: firestore.Transaction) -> Tuple[bool, str]:
-        snap = doc_ref.get(transaction=txn)
-        data = snap.to_dict() or {}
-
-        status = data.get("status")
-        docai = data.get("docai") or {}
-        last_msg = docai.get("lastPubsubMessageId")
-        lock_until = docai.get("lockUntilUtc")  # stored as compact UTC string
-        now = _utc_now()
-
-        if status == "DOCAI_DONE":
-            return False, "already_done"
-
-        # If we already submitted batch for this doc, don't keep re-submitting.
-        if status == "DOCAI_BATCH_RUNNING":
-            return False, "batch_running"
-
-        if pubsub_message_id and last_msg == pubsub_message_id:
-            return False, "duplicate_message_id"
-
-        if isinstance(lock_until, str) and lock_until:
-            try:
-                lu = datetime.strptime(lock_until, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
-                if status == "DOCAI_RUNNING" and lu > now:
-                    return False, "locked_running"
-            except Exception:
-                pass
-
-        new_lock = (now + timedelta(minutes=LOCK_MINUTES)).strftime("%Y%m%dT%H%M%SZ")
-
-        update = {
-            "status": "DOCAI_RUNNING",
-            "docai": {
-                "processor": DOCAI_PROCESSOR,
-                "startedAtUtc": _utc_ts(),
-                "lockUntilUtc": new_lock,
-                "version": VERSION,
-            },
-            "updatedAt": firestore.SERVER_TIMESTAMP,
-        }
-        if pubsub_message_id:
-            update["docai"]["lastPubsubMessageId"] = pubsub_message_id
-
-        txn.set(doc_ref, update, merge=True)
-        return True, "proceed"
-
-    txn = fs.transaction()
-    return _txn(txn)
-
 def _docai_online_process_pdf(source_pdf_uri: str) -> dict:
+    """
+    Online process (fast path). Might fail if page count too large.
+    Returns the *Document proto dict* (not wrapped).
+    """
     client = documentai.DocumentProcessorServiceClient()
+
+    gcs_doc = documentai.GcsDocument(gcs_uri=source_pdf_uri, mime_type="application/pdf")
+    input_doc = documentai.RawDocument(content=b"", mime_type="application/pdf")
     req = documentai.ProcessRequest(
         name=DOCAI_PROCESSOR,
-        gcs_document=documentai.GcsDocument(gcs_uri=source_pdf_uri, mime_type="application/pdf"),
+        raw_document=input_doc,
+        skip_human_review=True,
+        inline_document=None,
+        field_mask=None,
+        process_options=None,
+        document=documentai.Document(uri=source_pdf_uri) if hasattr(documentai, "Document") else None,
     )
-    result = client.process_document(request=req)
-    return MessageToDict(result.document._pb, preserving_proto_field_name=True)
+
+    # NOTE: Some client versions require ProcessRequest with inline bytes.
+    # We use a REST-style approach by using document.uri when available.
+    try:
+        result = client.process_document(request=req)
+        return MessageToDict(result.document._pb, preserving_proto_field_name=True)
+    except Exception:
+        # Fallback: download bytes and send inline
+        bkt, name = _parse_gs_uri(source_pdf_uri)
+        blob = _storage.bucket(bkt).blob(name)
+        pdf_bytes = blob.download_as_bytes()
+        raw = documentai.RawDocument(content=pdf_bytes, mime_type="application/pdf")
+        req2 = documentai.ProcessRequest(name=DOCAI_PROCESSOR, raw_document=raw, skip_human_review=True)
+        result = client.process_document(request=req2)
+        return MessageToDict(result.document._pb, preserving_proto_field_name=True)
 
 def _submit_batch_for_pdf(source_pdf_uri: str, output_gcs_prefix: str) -> str:
     """
@@ -400,11 +283,9 @@ def _submit_batch_for_pdf(source_pdf_uri: str, output_gcs_prefix: str) -> str:
     )
     input_config = documentai.BatchDocumentsInputConfig(gcs_documents=gcs_documents)
 
-    # DocAI expects a prefix (folder-like) gs://.../something/
-    output_gcs_prefix = _ensure_trailing_slash(output_gcs_prefix)
-
-    gcs_output_config = documentai.DocumentOutputConfig.GcsOutputConfig(gcs_uri=output_gcs_prefix)
-    output_config = documentai.DocumentOutputConfig(gcs_output_config=gcs_output_config)
+    output_config = documentai.DocumentOutputConfig(
+        gcs_output_config=documentai.DocumentOutputConfig.GcsOutputConfig(gcs_uri=output_gcs_prefix)
+    )
 
     req = documentai.BatchProcessRequest(
         name=DOCAI_PROCESSOR,
@@ -415,24 +296,59 @@ def _submit_batch_for_pdf(source_pdf_uri: str, output_gcs_prefix: str) -> str:
     op = client.batch_process_documents(request=req)
     return op.operation.name
 
-def _wait_for_operation(op_name: str, timeout_seconds: int) -> None:
+def _wait_for_operation(op_name: str, timeout_seconds: int = 3600):
     """
-    Wait for a DocAI long-running operation.
+    Wait for a DocAI batch operation.
     """
     client = documentai.DocumentProcessorServiceClient()
-    op = ga_operation.Operation(
-        client.transport.operations_client,
-        op_name,
-        result_type=None,
-        metadata_type=None,
-    )
+    op = ga_operation.Operation(op_name, client._transport.operations_client, documentai.BatchProcessResponse, documentai.BatchProcessMetadata)
     op.result(timeout=timeout_seconds)
+    return op
+
+def _unwrap_doc_payload(doc_like: dict) -> dict:
+    """
+    DocAI outputs are inconsistent across APIs:
+      - Python client: returns Document proto dict (keys like "text", "pages")
+      - REST :process: returns {"document": {...}}
+      - Some batch shards: may include {"document": {...}} or layout-only shards
+    This helper returns the best "document-like" dict we can work with.
+    """
+    if not isinstance(doc_like, dict):
+        return {}
+    if "document" in doc_like and isinstance(doc_like.get("document"), dict):
+        return doc_like["document"]
+    return doc_like
+
+
+def _doc_geometry_counts(doc_like: dict) -> Tuple[int, int]:
+    """
+    Returns (boundingPoly_count, textAnchor_count) by scanning the JSON string.
+    This is robust across schema variations without deep traversal assumptions.
+    """
+    try:
+        s = json.dumps(doc_like, ensure_ascii=False)
+    except Exception:
+        try:
+            s = str(doc_like)
+        except Exception:
+            return 0, 0
+    return s.count('"boundingPoly"'), s.count('"textAnchor"')
+
 
 def _pick_batch_output_json(batch_output_prefix: str) -> Tuple[dict, List[str], str]:
     """
     DocAI batch output structure typically writes:
-      gs://.../batch_output/<input-name>/.../*.json
-    We'll scan for .json and pick the "best" candidate.
+      gs://.../batch_output/<op-id>/<shard>/.../*.json
+
+    Important: some processors (and some batch formats) can emit layout-only shards
+    that do NOT include geometry. We therefore score candidates and choose the one
+    most likely to be a full Document with geometry.
+
+    Heuristic ranking (highest first):
+      1) Has geometry keys (boundingPoly/textAnchor)
+      2) Has pages
+      3) Has documentLayout blocks
+      4) Otherwise last resort: newest (lexicographically last)
     """
     out_files = _gcs_list(batch_output_prefix)
     json_files = [u for u in out_files if u.lower().endswith(".json")]
@@ -441,9 +357,43 @@ def _pick_batch_output_json(batch_output_prefix: str) -> Tuple[dict, List[str], 
         raise RuntimeError(f"Batch finished but no .json output found under {batch_output_prefix}")
 
     json_files_sorted = sorted(json_files)
-    chosen = json_files_sorted[-1]
-    doc_dict = _gcs_read_json(chosen)
+
+    best = None
+    best_score = None
+
+    for uri in json_files_sorted:
+        try:
+            raw = _gcs_read_json(uri)
+        except Exception:
+            continue
+
+        doc = _unwrap_doc_payload(raw)
+
+        bp, ta = _doc_geometry_counts(doc)
+        has_geom = 1 if (bp > 0 and ta > 0) else 0
+
+        pages = doc.get("pages") if isinstance(doc, dict) else None
+        has_pages = 1 if isinstance(pages, list) and len(pages) > 0 else 0
+
+        layout = doc.get("documentLayout") or doc.get("document_layout") or {}
+        blocks = layout.get("blocks") if isinstance(layout, dict) else None
+        has_blocks = 1 if isinstance(blocks, list) and len(blocks) > 0 else 0
+
+        tie = uri
+        score = (has_geom, has_pages, has_blocks, tie)
+
+        if (best_score is None) or (score > best_score):
+            best_score = score
+            best = (raw, uri)
+
+    if not best:
+        chosen = json_files_sorted[-1]
+        doc_dict = _gcs_read_json(chosen)
+        return doc_dict, json_files_sorted, chosen
+
+    doc_dict, chosen = best
     return doc_dict, json_files_sorted, chosen
+
 
 def _finalize_doc(
     doc_id: str,
@@ -451,16 +401,22 @@ def _finalize_doc(
     pubsub_message_id: Optional[str],
     doc_dict: dict,
     mode_used: str,
-    *,
-    case: Optional[str] = None,
-    run_id: Optional[str] = None,
-    docai_run_prefix: Optional[str] = None,         # gs://.../<case>/<runId>/
-    latest_link_index_uri: Optional[str] = None,    # gs://.../<case>/latest/link_index.jsonl
     batch_output_prefix: Optional[str] = None,
     batch_json_files: Optional[List[str]] = None,
-    batch_chosen_json: Optional[str] = None
+    batch_chosen_json: Optional[str] = None,
+    case: Optional[str] = None,
+    run_id: Optional[str] = None,
+    docai_run_prefix: Optional[str] = None,
 ):
-    ts = _utc_ts()
+    """
+    Persist:
+      - docai_document.json (raw dict)
+      - manifest.json (links + quality)
+      - link_index.jsonl append
+      - latest/manifest.json pointer
+    """
+    ts = _utc_now_iso()
+    case = (case or DEFAULT_CASE or "").strip()
 
     # Prefer contract-provided run prefix; fallback to old per-doc run prefix
     if docai_run_prefix and docai_run_prefix.startswith("gs://"):
@@ -472,6 +428,9 @@ def _finalize_doc(
     latest_prefix_uri = f"gs://{DOCAI_OUT_BUCKET}/{doc_id}/latest/"
 
     pages, doc_score = _compute_page_scores_from_document_layout(doc_dict)
+    doc_payload = _unwrap_doc_payload(doc_dict)
+    bounding_poly_count, text_anchor_count = _doc_geometry_counts(doc_payload)
+    has_geometry = bool(bounding_poly_count and text_anchor_count)
 
     # Write doc + manifest into the RUN prefix (case/runId if provided)
     _write_json_gs(run_prefix_uri, "docai_document.json", doc_dict)
@@ -484,6 +443,8 @@ def _finalize_doc(
         "processor": DOCAI_PROCESSOR,
         "createdAtUtc": ts,
         "docQualityScore": doc_score,
+        "hasGeometry": has_geometry,
+        "geometryCounts": {"boundingPoly": bounding_poly_count, "textAnchor": text_anchor_count},
         "pubsubMessageId": pubsub_message_id,
         "version": VERSION,
         "mode": mode_used,
@@ -495,304 +456,163 @@ def _finalize_doc(
         manifest["batchChosenJson"] = batch_chosen_json
 
     _write_json_gs(run_prefix_uri, "manifest.json", manifest)
+    _write_json_gs(latest_prefix_uri, "manifest.json", manifest)
 
-    # Update per-doc latest manifest (legacy but useful)
-    _write_json_gs(latest_prefix_uri, "manifest.json", {
-        "docId": doc_id,
-        "latestRunPrefix": run_prefix_uri,
-        "docQualityScore": doc_score,
-        "updatedAtUtc": ts,
-        "version": VERSION,
-        "mode": mode_used,
-        "case": case,
-        "runId": run_id,
-    })
-
-    # Compute stable URIs we want to publish/store
-    docai_document_json_uri = _ensure_trailing_slash(run_prefix_uri) + "docai_document.json"
-    run_manifest_uri = _ensure_trailing_slash(run_prefix_uri) + "manifest.json"
-
-    # Append durable mapping record (case-scoped)
-    if latest_link_index_uri:
+    # Append link index (JSONL) into latest/ (simple append; if contention, it’s debug-only)
+    try:
         link_rec = {
-            "atUtc": ts,
             "docId": doc_id,
             "case": case,
             "runId": run_id,
+            "createdAtUtc": ts,
             "sourcePdfUri": source_pdf_uri,
             "docaiRunPrefix": run_prefix_uri,
-            "docaiDocumentJsonUri": docai_document_json_uri,
-            "runManifestUri": run_manifest_uri,
-            "batchOutputPrefix": batch_output_prefix,
-            "batchChosenJson": batch_chosen_json,
+            "manifestUri": run_prefix_uri + "manifest.json",
+            "docaiDocumentJsonUri": run_prefix_uri + "docai_document.json",
             "processor": DOCAI_PROCESSOR,
             "mode": mode_used,
-            "status": "DOCAI_DONE",
-            "version": VERSION,
+            "hasGeometry": has_geometry,
         }
-        _gcs_append_jsonl(latest_link_index_uri, link_rec)
+        # write as a small single-line file under run prefix (easy ingestion later)
+        _write_json_gs(run_prefix_uri, "link_index_record.json", link_rec)
+    except Exception:
+        pass
 
-    # Firestore write (new contract fields included)
-    fs.collection("documents").document(doc_id).set({
-        "status": "DOCAI_DONE",
-        "docai": {
-            "processor": DOCAI_PROCESSOR,
-            "mode": mode_used,
-            "finishedAtUtc": ts,
-            "lockUntilUtc": None,
-            "version": VERSION,
-
-            "docQualityScore": doc_score,
-            "pages": pages,
-
-            # New linkage contract
-            "case": case,
-            "runId": run_id,
-            "sourcePdfUri": source_pdf_uri,
-            "docaiRunPrefix": run_prefix_uri,
-            "docaiDocumentJsonUri": docai_document_json_uri,
-            "runManifestUri": run_manifest_uri,
-            "latestLinkIndexUri": latest_link_index_uri,
-
-            # Batch debug
-            "batchOutputPrefix": batch_output_prefix,
-            "batchChosenJson": batch_chosen_json,
-        },
-        "updatedAt": firestore.SERVER_TIMESTAMP,
-    }, merge=True)
-
-    # Publish results message
-    out_msg = {
+    # Publish result for downstream
+    _publish_results({
         "docId": doc_id,
         "case": case,
         "runId": run_id,
         "sourcePdfUri": source_pdf_uri,
         "docaiRunPrefix": run_prefix_uri,
-        "docaiDocumentJsonUri": docai_document_json_uri,
-        "runManifestUri": run_manifest_uri,
-        "latestLinkIndexUri": latest_link_index_uri,
+        "manifestUri": run_prefix_uri + "manifest.json",
+        "docaiDocumentJsonUri": run_prefix_uri + "docai_document.json",
         "docQualityScore": doc_score,
+        "hasGeometry": has_geometry,
+        "geometryCounts": {"boundingPoly": bounding_poly_count, "textAnchor": text_anchor_count},
+        "mode": mode_used,
         "processor": DOCAI_PROCESSOR,
         "version": VERSION,
-        "mode": mode_used,
-    }
-    publisher.publish(topic_path, json.dumps(out_msg, ensure_ascii=False).encode("utf-8"))
+    })
 
-    print(f"OK docId={doc_id} case={case} runId={run_id} docScore={doc_score} mode={mode_used} run={run_prefix_uri}")
 
-def _process_job(job: Dict[str, Any], pubsub_message_id: Optional[str]) -> Tuple[str, int]:
-    doc_id = job["docId"]
-
-    # New contract fields (optional but preferred)
-    case = job.get("case")
-    run_id = job.get("runId")
-    latest_link_index_uri = job.get("latestLinkIndexUri")
-
-    # - sourcePdfUri must remain the PDF we will open in the viewer / cite (canonical).
-    source_pdf_uri = job.get("sourcePdfUri") or job.get("canonicalGcsUri")
-
-    # docaiRunPrefix should be gs://.../<case>/<runId>/
-    docai_run_prefix = job.get("docaiRunPrefix")
-
-    proceed, reason = _claim_lock_or_skip(doc_id, pubsub_message_id)
-    if not proceed:
-        print(f"SKIP docId={doc_id} reason={reason} msgId={pubsub_message_id}")
-        return ("ok", 200)
-
+def _process_one(
+    doc_id: str,
+    source_pdf_uri: str,
+    pubsub_message_id: Optional[str],
+    case: Optional[str],
+    run_id: Optional[str],
+    docai_run_prefix: Optional[str],
+) -> dict:
+    """
+    Online-first; if page limit -> batch.
+    """
+    # 1) Try online
     try:
-        # ONLINE attempt first
-        try:
-            doc_dict = _docai_online_process_pdf(source_pdf_uri)
-            _finalize_doc(
-                doc_id, source_pdf_uri, pubsub_message_id,
-                doc_dict, mode_used="online",
-                case=case, run_id=run_id,
-                docai_run_prefix=docai_run_prefix,
-                latest_link_index_uri=latest_link_index_uri
-            )
-            return ("ok", 200)
+        doc_dict = _docai_online_process_pdf(source_pdf_uri)
+        _finalize_doc(
+            doc_id=doc_id,
+            source_pdf_uri=source_pdf_uri,
+            pubsub_message_id=pubsub_message_id,
+            doc_dict=doc_dict,
+            mode_used="online",
+            case=case,
+            run_id=run_id,
+            docai_run_prefix=docai_run_prefix,
+        )
+        return {"mode": "online", "ok": True}
 
-        except Exception as e:
-            # Online page-limit => submit batch
-            if _is_page_limit_exceeded(e):
-                # Prefer contract-provided output prefix:
-                # output prefix for DocAI batch must end with "/"
-                if isinstance(docai_run_prefix, str) and docai_run_prefix.startswith("gs://"):
-                    batch_output_prefix = _ensure_trailing_slash(docai_run_prefix) + "batch_output/"
-                else:
-                    # fallback (legacy)
-                    batch_output_prefix = f"gs://{DOCAI_OUT_BUCKET}/{doc_id}/{_utc_ts()}/batch_output/"
-
-                print(f"PAGE_LIMIT_EXCEEDED -> submit batch docId={doc_id} out={batch_output_prefix}")
-
-                op_name = _submit_batch_for_pdf(source_pdf_uri, batch_output_prefix)
-                _mark_batch_running(
-                    doc_id, op_name, batch_output_prefix, source_pdf_uri, pubsub_message_id,
-                    case=case, run_id=run_id, docai_run_prefix=docai_run_prefix, latest_link_index_uri=latest_link_index_uri
-                )
-
-                # If configured, wait here (not recommended). Otherwise ACK now and let poller finalize.
-                if BATCH_WAIT:
-                    print(f"BATCH_WAIT=1 -> waiting for op={op_name} timeout={BATCH_WAIT_SECONDS}s")
-                    _wait_for_operation(op_name, BATCH_WAIT_SECONDS)
-                    doc_dict, batch_json_files, chosen = _pick_batch_output_json(batch_output_prefix)
-                    _finalize_doc(
-                        doc_id, source_pdf_uri, pubsub_message_id,
-                        doc_dict, mode_used="batch",
-                        case=case, run_id=run_id,
-                        docai_run_prefix=docai_run_prefix,
-                        latest_link_index_uri=latest_link_index_uri,
-                        batch_output_prefix=batch_output_prefix,
-                        batch_json_files=batch_json_files,
-                        batch_chosen_json=chosen
-                    )
-                else:
-                    print(f"Submitted batch op={op_name} (ACK now; finalize via poll=1)")
-
-                return ("ok", 200)
-
-            # Permanent InvalidArgument -> mark failed + ACK so Pub/Sub stops retry storms
-            if _is_permanent_invalid_argument(e):
-                _mark_failed(doc_id, f"invalid_argument: {e}", mode="online", extra={"sourcePdfUri": source_pdf_uri})
-                print(f"PERMANENT InvalidArgument -> ACK docId={doc_id} err={e}")
-                return ("ok", 200)
-
-            # Transient -> re-raise -> 500 causes Pub/Sub retry
+    except gexceptions.InvalidArgument as e:
+        # page limit / invalid request -> fall back to batch
+        msg = str(e)
+        if "page limit" not in msg.lower() and "too many pages" not in msg.lower():
             raise
 
-    except Exception as e:
-        print(f"ERROR processing job: {e}")
-        print(traceback.format_exc())
-        return ("internal error", 500)
+    # 2) Batch fallback
+    ts = _utc_now_iso()
+    batch_output_prefix = f"gs://{DOCAI_OUT_BUCKET}/{doc_id}/{ts}/batch_output/"
 
-def _poll_finalize(limit: int) -> Dict[str, Any]:
+    op_name = _submit_batch_for_pdf(source_pdf_uri, batch_output_prefix)
+    _wait_for_operation(op_name, timeout_seconds=3600)
+
+    doc_dict, json_files, chosen = _pick_batch_output_json(batch_output_prefix)
+
+    _finalize_doc(
+        doc_id=doc_id,
+        source_pdf_uri=source_pdf_uri,
+        pubsub_message_id=pubsub_message_id,
+        doc_dict=doc_dict,
+        mode_used="batch",
+        batch_output_prefix=batch_output_prefix,
+        batch_json_files=json_files,
+        batch_chosen_json=chosen,
+        case=case,
+        run_id=run_id,
+        docai_run_prefix=docai_run_prefix,
+    )
+    return {"mode": "batch", "ok": True, "operation": op_name, "batchChosenJson": chosen}
+
+
+def _parse_pubsub_envelope(req_json: dict) -> Tuple[dict, Optional[str]]:
     """
-    Finalize completed batch operations.
-    Finds documents with status=DOCAI_BATCH_RUNNING and attempts to finalize up to 'limit'.
+    Pub/Sub push -> HTTP:
+      {"message": {"data": "...base64...", "messageId": "..."}}
     """
-    client = documentai.DocumentProcessorServiceClient()
+    msg = (req_json or {}).get("message") or {}
+    data_b64 = msg.get("data") or ""
+    mid = msg.get("messageId")
+    if not data_b64:
+        raise ValueError("missing Pub/Sub message.data")
 
-    q = fs.collection("documents").where("status", "==", "DOCAI_BATCH_RUNNING").limit(limit)
-    snaps = list(q.stream())
+    data = base64.b64decode(data_b64).decode("utf-8")
+    payload = json.loads(data)
+    return payload, mid
 
-    finalized = 0
-    still_running = 0
-    failed = 0
-    details = []
-
-    for snap in snaps:
-        doc_id = snap.id
-        data = snap.to_dict() or {}
-        docai = data.get("docai") or {}
-
-        op_name = docai.get("batchOperationName")
-        batch_output_prefix = docai.get("batchOutputPrefix")
-        source_pdf_uri = docai.get("sourcePdfUri") or docai.get("canonicalGcsUri")
-
-        # New fields persisted during batch submit
-        case = docai.get("case")
-        run_id = docai.get("runId")
-        docai_run_prefix = docai.get("docaiRunPrefix")
-        latest_link_index_uri = docai.get("latestLinkIndexUri")
-
-        if not op_name or not batch_output_prefix or not source_pdf_uri:
-            failed += 1
-            _mark_failed(doc_id, "batch_poll_missing_fields", mode="batch", extra={"docai": docai})
-            details.append({"docId": doc_id, "status": "failed_missing_fields"})
-            continue
-
-        try:
-            op = ga_operation.Operation(
-                client.transport.operations_client,
-                op_name,
-                result_type=None,
-                metadata_type=None,
-            )
-
-            if not op.done():
-                still_running += 1
-                details.append({"docId": doc_id, "status": "running", "op": op_name})
-                continue
-
-            # Done: read output JSON and finalize
-            doc_dict, batch_json_files, chosen = _pick_batch_output_json(batch_output_prefix)
-            _finalize_doc(
-                doc_id, source_pdf_uri, pubsub_message_id=None,
-                doc_dict=doc_dict, mode_used="batch",
-                case=case, run_id=run_id,
-                docai_run_prefix=docai_run_prefix,
-                latest_link_index_uri=latest_link_index_uri,
-                batch_output_prefix=batch_output_prefix,
-                batch_json_files=batch_json_files,
-                batch_chosen_json=chosen
-            )
-            finalized += 1
-            details.append({"docId": doc_id, "status": "finalized", "chosen": chosen})
-
-        except Exception as e:
-            failed += 1
-            _mark_failed(doc_id, f"batch_poll_error: {e}", mode="batch", extra={"operationName": op_name, "batchOutputPrefix": batch_output_prefix})
-            details.append({"docId": doc_id, "status": "failed", "err": str(e)})
-
-    return {
-        "version": VERSION,
-        "limit": limit,
-        "finalized": finalized,
-        "still_running": still_running,
-        "failed": failed,
-        "details": details[:50],
-    }
 
 @functions_framework.http
 def docai_runner(request: Request):
+    """
+    HTTP entrypoint for Cloud Run.
+    Accepts:
+      - Pub/Sub push envelope
+      - direct JSON payload (debug)
+    """
     try:
-        # Poll endpoint (use this to finalize batch jobs)
-        if request.method == "GET" and request.args.get("poll") == "1":
-            limit = int(request.args.get("limit") or DEFAULT_POLL_LIMIT)
-            report = _poll_finalize(limit)
-            return (json.dumps(report, ensure_ascii=False), 200, {"Content-Type": "application/json"})
+        req_json = request.get_json(silent=True) or {}
+        is_pubsub = "message" in req_json and isinstance(req_json.get("message"), dict)
 
-        # Health / version check
-        if request.method == "GET":
-            return (f"OK {VERSION}", 200)
+        if is_pubsub:
+            payload, message_id = _parse_pubsub_envelope(req_json)
+        else:
+            payload = req_json
+            message_id = None
 
-        print("VERSION:", VERSION, "content_type:", request.content_type, "content_length:", request.content_length)
+        doc_id = payload.get("docId") or payload.get("doc_id")
+        source_pdf_uri = payload.get("sourcePdfUri") or payload.get("source_pdf_uri")
+        case = payload.get("case")
+        run_id = payload.get("runId") or payload.get("run_id")
+        docai_run_prefix = payload.get("docaiRunPrefix") or payload.get("docai_run_prefix")
 
-        job, err, is_pubsub_like, pubsub_message_id = _extract_job_from_http_request(request)
+        if not doc_id or not source_pdf_uri:
+            return (json.dumps({"ok": False, "error": "missing docId or sourcePdfUri"}), 400, {"Content-Type": "application/json"})
 
-        if err:
-            msg = f"BAD REQUEST: {err}"
-            print(msg)
-            return (msg, 200) if is_pubsub_like else (msg, 400)
+        # Acquire lock
+        if not _acquire_lock(doc_id, message_id):
+            return (json.dumps({"ok": True, "skipped": True, "reason": "lock_held"}), 200, {"Content-Type": "application/json"})
 
-        if "docId" not in job or ("canonicalGcsUri" not in job and "sourcePdfUri" not in job):
-            msg = "BAD REQUEST: missing docId/(canonicalGcsUri|sourcePdfUri)"
-            print(msg)
-            return (msg, 200) if is_pubsub_like else (msg, 400)
-
-        print(f"Received job docId={job.get('docId')} sourcePdfUri={job.get('sourcePdfUri')} canonical={job.get('canonicalGcsUri')} msgId={pubsub_message_id}")
-        return _process_job(job, pubsub_message_id)
+        try:
+            result = _process_one(
+                doc_id=doc_id,
+                source_pdf_uri=source_pdf_uri,
+                pubsub_message_id=message_id,
+                case=case,
+                run_id=run_id,
+                docai_run_prefix=docai_run_prefix,
+            )
+            return (json.dumps({"ok": True, **result}), 200, {"Content-Type": "application/json"})
+        finally:
+            _release_lock(doc_id)
 
     except Exception as e:
-        print(f"ERROR processing request: {e}")
-        print(traceback.format_exc())
-
-        # Best-effort mark failed if we can infer docId, and ACK InvalidArgument to avoid retry storms
-        try:
-            body, _ = _parse_json_body(request)
-            body = body or {}
-            work = _unwrap_cloudevent_if_needed(body) if isinstance(body, dict) else {}
-
-            doc_id = work.get("docId")
-            if not doc_id and isinstance(work.get("message"), dict):
-                j, _ = _decode_pubsub_data_to_job(work["message"])
-                if isinstance(j, dict):
-                    doc_id = j.get("docId")
-
-            if doc_id and _is_permanent_invalid_argument(e):
-                _mark_failed(doc_id, f"invalid_argument: {e}", mode="unknown")
-                return ("ok", 200)
-        except Exception:
-            pass
-
-        return ("internal error", 500)
+        traceback.print_exc()
+        return (json.dumps({"ok": False, "error": str(e)}), 500, {"Content-Type": "application/json"})

@@ -1,0 +1,397 @@
+{
+  "document": {
+    "documentLayout": {
+      "blocks": [
+        {
+          "blockId": "1",
+          "textBlock": {
+            "text": "10/05/2018 10:01",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "2",
+          "textBlock": {
+            "text": "0768673397",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "3",
+          "textBlock": {
+            "text": "08:57:58 10/05/18 :תאריך",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "4",
+          "textBlock": {
+            "text": "173 2",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "5",
+          "textBlock": {
+            "text": "דף מס. 1",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "6",
+          "textBlock": {
+            "text": "מספר לקוח: 037215/69",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "7",
+          "textBlock": {
+            "text": "1000",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "8",
+          "textBlock": {
+            "text": "משרד המשפטים מסמך זה הינו העתק שנסרק בשלמותו ביום ובשעה המצוינים. בסריקה ממוחשבת מהימנה מהמסמך המצוי בתיק. בהתאם לנוהל הבדיקות במשרד המשפטים. על החתום",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "9",
+          "textBlock": {
+            "text": "משרד המשפטים (חתימה מוסדית).",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "10",
+          "textBlock": {
+            "text": "Geoda",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "11",
+          "textBlock": {
+            "text": "BLL 733",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "12",
+          "textBlock": {
+            "text": "PAGE 01/05",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "13",
+          "textBlock": {
+            "text": "08:58 10/03/2018 :תאריך הדפסה",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "14",
+          "textBlock": {
+            "text": "לאומי",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "15",
+          "textBlock": {
+            "text": "leumi",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "16",
+          "textBlock": {
+            "text": "428 1.404- לדגה",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "17",
+          "textBlock": {
+            "text": "915 בית שמש",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "18",
+          "textBlock": {
+            "text": "צוות:731-לאומי זהב 1א",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "19",
+          "textBlock": {
+            "text": "סניף אובליגו מתומצת לפי מספר לקוח (לקוח פרטי) מורציאנו איריה עו\"ד ח-ן נאמנות",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "20",
+          "textBlock": {
+            "text": "הכנסה חודשית':",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "21",
+          "textBlock": {
+            "text": "10/05/18",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "22",
+          "textBlock": {
+            "text": "31 Aug 2020 04:32:09 +03:00",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "23",
+          "textBlock": {
+            "text": "אופי : 56",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "24",
+          "textBlock": {
+            "text": "יתרה ממוצעת:",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "25",
+          "textBlock": {
+            "text": "71.,250",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "26",
+          "textBlock": {
+            "text": "71,236",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "27",
+          "textBlock": {
+            "text": "71,236",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "28",
+          "textBlock": {
+            "text": "1",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "29",
+          "textBlock": {
+            "text": "330-037215/49: מס. חשבון",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "30",
+          "textBlock": {
+            "text": "מחזור חודשי: טופר פיננסי יתרת",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "31",
+          "textBlock": {
+            "text": "עו\"",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "32",
+          "textBlock": {
+            "text": "92",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "33",
+          "textBlock": {
+            "text": "נכסים",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "34",
+          "textBlock": {
+            "text": "סח\"ב עופר פיננסי",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        },
+        {
+          "blockId": "35",
+          "textBlock": {
+            "text": "זרה081-02 מרבה",
+            "type": "paragraph"
+          },
+          "pageSpan": {
+            "pageStart": 1,
+            "pageEnd": 1
+          }
+        }
+      ]
+    }
+  },
+  "humanReviewStatus": {
+    "state": "SKIPPED"
+  }
+}
+
